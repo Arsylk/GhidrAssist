@@ -1213,6 +1213,7 @@ if (responseObj.has("data") && responseObj.get("data").isJsonArray()) {
                                             toolCalls.add(new ToolCall(tcId, acc.name, args));
                                         });
 
+                                    finishReason = normalizeFinishReasonForToolCalls(finishReason, toolCalls);
                                     handler.onStreamComplete(finishReason, textBuilder.toString(),
                                         reasoningBuilder.toString(), toolCalls);
                                     return;
@@ -1296,7 +1297,8 @@ if (responseObj.has("data") && responseObj.get("data").isJsonArray()) {
                                 }
                             }
                             finishReason = normalizeFinishReasonForToolCalls(finishReason, finalToolCalls);
-                            handler.onStreamComplete(finishReason, textBuilder.toString(), finalToolCalls);
+                            handler.onStreamComplete(finishReason, textBuilder.toString(),
+                                reasoningBuilder.toString(), finalToolCalls);
                         }
                     } catch (IOException e) {
                         handler.onError(new ResponseException(name, operation,

@@ -253,7 +253,64 @@ public class MCPServersTab extends JPanel {
     private void refreshTable() {
         tableModel.refresh();
     }
-    
+
+    /**
+     * Refresh MCP tools by reconnecting to all enabled servers.
+     * This ensures newly discovered tools are available to the AI.
+     */
+    private void refreshTools() {
+        refreshToolsButton.setEnabled(false);
+        refreshToolsButton.setText("Refreshing...");
+
+        SwingWorker<Void, Void> worker = new SwingWorker<Void, Void>() {
+            private int toolCount = 0;
+            private String errorMessage = null;
+
+            @Override
+            protected Void doInBackground() throws Exception {
+                try {
+                    ghidrassist.mcp2.tools.MCPToolManager toolManager =
+                        ghidrassist.mcp2.tools.MCPToolManager.getInstance();
+
+                    toolManager.refreshConnections().get();
+                    toolCount = toolManager.getAllMCPTools().size();
+
+                } catch (Exception e) {
+                    errorMessage = e.getMessage();
+                    throw e;
+                }
+                return null;
+            }
+
+            @Override
+            protected void done() {
+                refreshToolsButton.setEnabled(true);
+                refreshToolsButton.setText("Refresh Tools");
+
+                try {
+                    get();
+
+                    JOptionPane.showMessageDialog(
+                        MCPServersTab.this,
+                        "Tools refreshed successfully!\n\n" +
+                        "Total tools available: " + toolCount,
+                        "Refresh Complete",
+                        JOptionPane.INFORMATION_MESSAGE
+                    );
+                } catch (Exception e) {
+                    JOptionPane.showMessageDialog(
+                        MCPServersTab.this,
+                        "Refresh failed:\n\n" +
+                        (errorMessage != null ? errorMessage : e.getMessage()),
+                        "Refresh Error",
+                        JOptionPane.ERROR_MESSAGE
+                    );
+                }
+            }
+        };
+        worker.execute();
+    }
+
     private static class MCPServersTableModel extends AbstractTableModel {
         private static final String[] COLUMN_NAMES = {"Name", "Target", "Enabled", "Transport"};
         private List<MCPServerConfig> servers;

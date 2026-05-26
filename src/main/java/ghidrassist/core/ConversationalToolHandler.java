@@ -620,10 +620,20 @@ public class ConversationalToolHandler {
                             assistantMsg.setThinkingContent(reasoningContent);
                         }
 
-                        // Only attach tool calls when stopReason indicates tool calling.
-                        // If stopReason is "stop" but streaming accumulated partial tool call deltas,
-                        // attaching them creates orphaned tool_calls (no results will follow).
-                        if ("tool_calls".equals(stopReason) && !toolCalls.isEmpty()) {
+                        // Trust complete tool calls even when stopReason is unexpected.
+                        // Some OpenAI-compatible endpoints (Gemini compat layer, LiteLLM proxies, etc.)
+                        // emit valid tool_calls but never set finish_reason="tool_calls", leaving it
+                        // as "stop" or null. The provider already normalizes this, but validate the
+                        // calls here too as defense-in-depth so any future provider quirk just works.
+                        boolean shouldExecuteTools = !toolCalls.isEmpty()
+                            && hasCompleteOpenAIToolCalls(toolCalls);
+
+                        if (shouldExecuteTools) {
+                            if (!"tool_calls".equals(stopReason)) {
+                                Msg.info(ConversationalToolHandler.this,
+                                    String.format("Executing %d tool calls despite stopReason='%s' (calls look complete)",
+                                        toolCalls.size(), stopReason));
+                            }
                             JsonArray toolCallsArray = new JsonArray();
                             for (OpenAIPlatformApiProvider.ToolCall toolCall : toolCalls) {
                                 JsonObject toolCallObj = new JsonObject();
@@ -1605,7 +1615,7 @@ public class ConversationalToolHandler {
         // Last attempt: lenient JsonReader (accepts unquoted keys, trailing commas, etc.)
         try {
             com.google.gson.stream.JsonReader reader = new com.google.gson.stream.JsonReader(new java.io.StringReader(argsStr));
-            reader.setStrictness(com.google.gson.Strictness.LENIENT);
+            reader.setLenient(true);
             JsonElement el = JsonParser.parseReader(reader);
             if (el.isJsonObject()) {
                 Msg.warn(this, "Tool arguments only parsed under lenient mode (likely model produced unquoted JSON)");

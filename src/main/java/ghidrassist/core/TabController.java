@@ -121,10 +121,16 @@ public class TabController {
     private ExplainTab explainTab;
     private QueryTab queryTab;
     private ActionsTab actionsTab;
+    private GlobalActionsTab globalActionsTab;
     private RAGManagementTab ragManagementTab;
     private SettingsTab settingsTab;
     private SemanticGraphTab semanticGraphTab;
     private SymGraphTab symGraphTab;
+
+    // Global analysis state (used by Global Actions tab)
+    private volatile TaskMonitor globalAnalyzeMonitor;
+    private final AtomicBoolean globalStopRequested = new AtomicBoolean(false);
+    private final AtomicBoolean globalAnalyzeRunning = new AtomicBoolean(false);
 
     private volatile String pendingAgentPlan;
     private volatile String pendingAgentQuery;

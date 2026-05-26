@@ -139,7 +139,7 @@ public class SemanticExtractor {
             return new ExtractionResult(summarized.get(), embeddingsGenerated.get(), errors.get(), elapsed);
         }
         Msg.info(this, "Using " + PARALLEL_WORKERS + " parallel workers");
-        ExecutorService executor = Executors.newFixedThreadPool(PARALLEL_WORKERS);
+        currentExecutor = Executors.newFixedThreadPool(PARALLEL_WORKERS);
 
         // Track active futures for cancellation
         List<Future<?>> activeFutures = new ArrayList<>();

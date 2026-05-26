@@ -786,7 +786,7 @@ public class GoogleGenAIProvider extends OpenAIPlatformApiProvider {
                             if (line.startsWith("data: ")) {
                                 String data = line.substring(6).trim();
                                 if (data.equals("[DONE]")) {
-                                    handler.onStreamComplete(finishReason, textBuilder.toString(), toolCalls);
+                                    handler.onStreamComplete(finishReason, textBuilder.toString(), "", toolCalls);
                                     return;
                                 }
 
@@ -840,7 +840,7 @@ public class GoogleGenAIProvider extends OpenAIPlatformApiProvider {
                         } else if (!handler.shouldContinue()) {
                             handler.onError(new StreamCancelledException(name, operation, StreamCancelledException.CancellationReason.USER_REQUESTED));
                         } else {
-                            handler.onStreamComplete(finishReason, textBuilder.toString(), toolCalls);
+                            handler.onStreamComplete(finishReason, textBuilder.toString(), "", toolCalls);
                         }
                     } catch (IOException e) {
                         handler.onError(new ResponseException(name, operation, ResponseException.ResponseErrorType.STREAM_INTERRUPTED, e));

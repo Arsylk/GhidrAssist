@@ -3,6 +3,7 @@ package ghidrassist.ui;
 import javax.swing.*;
 
 import ghidra.program.util.ProgramLocation;
+import ghidra.program.util.ProgramSelection;
 
 import java.awt.*;
 import ghidrassist.GhidrAssistPlugin;
@@ -63,6 +64,7 @@ public class GhidrAssistUI extends JPanel {
         tabbedPane.addTab("Explain", explainTab);
         tabbedPane.addTab("Query", queryTab);
         tabbedPane.addTab("Actions", actionsTab);
+        tabbedPane.addTab("Global Actions", globalActionsTab);
         tabbedPane.addTab("Semantic Graph", semanticGraphTab);
         tabbedPane.addTab("SymGraph", symGraphTab);
         tabbedPane.addTab("RAG", ragManagementTab);
