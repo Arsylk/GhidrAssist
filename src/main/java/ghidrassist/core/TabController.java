@@ -3,8 +3,10 @@ package ghidrassist.core;
 import ghidra.app.services.GoToService;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.listing.Function;
+import ghidra.program.model.listing.FunctionManager;
 import ghidra.program.model.listing.Program;
 import ghidra.program.util.ProgramLocation;
+import ghidra.program.util.ProgramSelection;
 import ghidra.util.Msg;
 import ghidra.util.task.Task;
 import ghidra.util.task.TaskLauncher;
@@ -12,8 +14,10 @@ import ghidra.util.task.TaskMonitor;
 import ghidrassist.AnalysisDB;
 import ghidrassist.GhidrAssistPlugin;
 import ghidrassist.LlmApi;
+import ghidrassist.apiprovider.APIProvider;
 import ghidrassist.apiprovider.APIProviderConfig;
 import ghidrassist.apiprovider.ReasoningConfig;
+import ghidrassist.graphrag.GraphRAGService;
 import ghidrassist.chat.PersistedChatMessage;
 import ghidrassist.services.*;
 import ghidrassist.services.RAGManagementService.RAGIndexStats;
@@ -32,6 +36,7 @@ import ghidrassist.workers.*;
 import ghidrassist.core.streaming.StreamingMarkdownRenderer;
 
 import com.google.gson.Gson;
+import com.google.gson.JsonObject;
 
 import java.sql.Timestamp;
 import java.time.Instant;
@@ -50,6 +55,7 @@ import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Responsibilities:
@@ -212,6 +218,7 @@ public class TabController {
         }
     }
     public void setActionsTab(ActionsTab tab) { this.actionsTab = tab; }
+    public void setGlobalActionsTab(GlobalActionsTab tab) { this.globalActionsTab = tab; }
     public void setRAGManagementTab(RAGManagementTab tab) { this.ragManagementTab = tab; }
     public void setSemanticGraphTab(SemanticGraphTab tab) {
         this.semanticGraphTab = tab;
@@ -238,7 +245,14 @@ public class TabController {
     public void setReasoningEffort(String level) {
         this.currentReasoningConfig = ReasoningConfig.fromString(level);
 
-        // Save to database
+        GraphRAGService graphRAGService = GraphRAGService.getInstance(analysisDB);
+        APIProviderConfig providerConfig = GhidrAssistPlugin.getCurrentProviderConfig();
+        if (providerConfig != null) {
+            APIProvider provider = providerConfig.createProvider();
+            provider.setReasoningConfig(this.currentReasoningConfig);
+            graphRAGService.setLLMProvider(provider);
+        }
+
         try {
             analysisDataService.saveReasoningEffort(level.toLowerCase());
             Msg.info(this, "Reasoning effort set to: " + level);
@@ -406,8 +420,23 @@ public class TabController {
                         }
 
                         Msg.info(this, "Creating SemanticExtractor with provider: " + providerConfig.getType());
+                        APIProvider provider = providerConfig.createProvider();
+                        
+                        try {
+                            String savedEffort = analysisDataService.getReasoningEffort();
+                            if (savedEffort != null && !savedEffort.equalsIgnoreCase("none")) {
+                                currentReasoningConfig = ReasoningConfig.fromString(savedEffort);
+                            }
+                        } catch (Exception e) {
+                            Msg.debug(this, "Failed to load reasoning effort from DB: " + e.getMessage());
+                        }
+
+                        if (currentReasoningConfig != null) {
+                            provider.setReasoningConfig(currentReasoningConfig);
+                        }
+                        
                         SemanticExtractor semanticExtractor = new SemanticExtractor(
-                                providerConfig.createProvider(), graph, analysisDataService.getContext());
+                                provider, graph, analysisDataService.getContext());
 
                         // Initialize streaming UI
                         // Note: StreamingMarkdownRenderer already calls invokeLater, so callback runs on EDT
@@ -684,7 +713,9 @@ public class TabController {
                     throw new Exception("No LLM provider configured.");
                 }
 
-                currentLineExplainLlmApi = new LlmApi(providerConfig, plugin);
+                APIProvider provider = providerConfig.createProvider();
+                provider.setReasoningConfig(currentReasoningConfig);
+                currentLineExplainLlmApi = new LlmApi(provider, plugin);
 
                 // Create response handler
                 LlmApi.LlmResponseHandler handler = createLineExplainResponseHandler(
@@ -1377,6 +1408,9 @@ public class TabController {
                 settingsTab.loadReasoningEffort();
                 settingsTab.loadMaxToolCalls();
             }
+
+            String savedEffort = getReasoningEffort();
+            setReasoningEffort(savedEffort);
         } catch (Exception e) {
             Msg.showError(this, settingsTab, "Error",
                 "Failed to load context: " + e.getMessage());
@@ -1905,6 +1939,8 @@ public class TabController {
         Msg.info(this, "DEBUG: Verified LlmApi config after set: " +
             verifyConfig.getEffort() + ", enabled=" + verifyConfig.isEnabled());
 
+        GraphRAGService.getInstance(analysisDB).setLLMProvider(currentLlmApi.getApiClient().getProvider());
+
         return currentLlmApi;
     }
     
@@ -2049,6 +2085,7 @@ public class TabController {
                         markdownHelper.markdownToHtml(fullResponse));
                     explainTab.setMarkdownSource(fullResponse);
                     setUIState(false, "Explain Line", null);
+                    setUIState(false, "Explain Function", null);
                 });
             }
 
@@ -2057,6 +2094,7 @@ public class TabController {
                 SwingUtilities.invokeLater(() -> {
                     explainTab.setExplanationText("An error occurred: " + error.getMessage());
                     setUIState(false, "Explain Line", null);
+                    setUIState(false, "Explain Function", null);
                 });
             }
 
@@ -3039,8 +3077,472 @@ public class TabController {
         symGraphController.updateBinaryInfo();
     }
 
+    // ==== Global Auto-Analyze ====
 
+    /**
+     * Launch a background binary-wide auto-analyze run. Proposals are routed by gate:
+     * high-confidence rename/retype proposals auto-apply in chunked transactions; weaker
+     * proposals and auto_create_struct land in the Global Actions table for manual review.
+     * Idempotent while running: re-invocation is a no-op.
+     */
+    public void handleAutoAnalyzeBinary() {
+        Program program = plugin.getCurrentProgram();
+        if (program == null) {
+            Msg.showInfo(getClass(), globalActionsTab, "No Program", "Open a program first.");
+            return;
+        }
+        List<Function> all = new ArrayList<>();
+        FunctionManager fm = program.getFunctionManager();
+        for (Function f : fm.getFunctions(true)) all.add(f);
+        launchGlobalAnalyze(program, all, "binary");
+    }
 
+    /**
+     * Launch a background auto-analyze run over functions overlapping the current CodeBrowser
+     * selection. Shares the same pipeline as {@link #handleAutoAnalyzeBinary()}; only the
+     * input function set differs.
+     */
+    public void handleAutoAnalyzeSelected() {
+        Program program = plugin.getCurrentProgram();
+        if (program == null) {
+            Msg.showInfo(getClass(), globalActionsTab, "No Program", "Open a program first.");
+            return;
+        }
+        ProgramSelection sel = plugin.getCurrentSelection();
+        if (sel == null || sel.isEmpty()) {
+            Msg.showInfo(getClass(), globalActionsTab, "No Selection",
+                "Select an address range in the CodeBrowser first.");
+            return;
+        }
+        FunctionManager fm = program.getFunctionManager();
+        java.util.LinkedHashSet<Function> collected = new java.util.LinkedHashSet<>();
+        java.util.Iterator<Function> it = fm.getFunctionsOverlapping(sel);
+        while (it.hasNext()) collected.add(it.next());
+        if (collected.isEmpty()) {
+            Msg.showInfo(getClass(), globalActionsTab, "No Functions in Selection",
+                "The current selection does not overlap any functions.");
+            return;
+        }
+        launchGlobalAnalyze(program, new ArrayList<>(collected), "selection");
+    }
+
+    /**
+     * Notify the Global Actions tab that the CodeBrowser selection changed so it can
+     * enable/disable the Analyze Selected button accordingly.
+     */
+    public void handleSelectionUpdate(ProgramSelection sel) {
+        if (globalActionsTab != null) {
+            globalActionsTab.onSelectionChanged(sel != null && !sel.isEmpty());
+        }
+    }
+
+    private void launchGlobalAnalyze(Program program, final List<Function> functions, String scopeLabel) {
+        if (globalActionsTab == null) {
+            Msg.showError(this, null, "Global Actions", "Global Actions tab is not initialized.");
+            return;
+        }
+        if (!globalAnalyzeRunning.compareAndSet(false, true)) {
+            return;
+        }
+        APIProviderConfig providerConfig = GhidrAssistPlugin.getCurrentProviderConfig();
+        if (providerConfig == null) {
+            globalAnalyzeRunning.set(false);
+            Msg.showError(this, globalActionsTab, "No API Provider",
+                "Configure an API provider in Settings first.");
+            return;
+        }
+
+        final GlobalAnalysisService.GlobalAnalysisConfig config = globalActionsTab.buildConfig();
+        if (config.actions == null || config.actions.isEmpty()) {
+            globalAnalyzeRunning.set(false);
+            Msg.showInfo(getClass(), globalActionsTab, "No Actions Selected",
+                "Enable at least one action in the Tuning panel.");
+            return;
+        }
+
+        ((DefaultTableModel) globalActionsTab.getTable().getModel()).setRowCount(0);
+        globalStopRequested.set(false);
+        globalActionsTab.setRunning(true);
+        globalActionsTab.setProgressText("Starting global analysis (" + scopeLabel + ", "
+            + functions.size() + " function(s))...");
+
+        final Program programRef = program;
+        final APIProviderConfig providerRef = providerConfig;
+        Task task = new Task("GhidrAssist Global Auto-Analyze", true, true, false) {
+            @Override
+            public void run(TaskMonitor monitor) {
+                globalAnalyzeMonitor = monitor;
+                if (globalStopRequested.get()) {
+                    monitor.cancel();
+                }
+
+                // Build struct signature registry off-EDT (DTM scan can be expensive).
+                final StructSignatureRegistry structRegistry =
+                    new StructSignatureRegistry(programRef.getDataTypeManager());
+                try {
+                    structRegistry.buildFromDtm();
+                } catch (Exception regEx) {
+                    Msg.warn(TabController.this, "StructSignatureRegistry build failed: " + regEx.getMessage());
+                }
+
+                GlobalAnalysisService service = new GlobalAnalysisService(plugin, providerRef);
+                int[] applied = new int[]{0};
+                int[] failed = new int[]{0};
+                int[] queued = new int[]{0};
+
+                GlobalAnalysisService.ProposalSink sink = proposal -> {
+                    if (monitor.isCancelled() || globalStopRequested.get()) return;
+                    monitor.setMessage(describeProgress(proposal, applied[0], queued[0]));
+                    globalActionsTab.setProgressText(describeProgress(proposal, applied[0], queued[0]));
+                    boolean autoApplied = routeProposal(programRef, proposal, config, structRegistry, applied, failed);
+                    if (!autoApplied) {
+                        queued[0]++;
+                        SwingUtilities.invokeLater(() -> appendProposalRow(proposal));
+                    }
+                };
+
+                GlobalAnalysisService.Summary summary = null;
+                try {
+                    summary = service.analyze(programRef, functions, config, monitor, sink);
+                } catch (ghidra.util.exception.CancelledException ce) {
+                    globalActionsTab.setProgressText(String.format(
+                        "Cancelled. applied=%d queued=%d failed=%d", applied[0], queued[0], failed[0]));
+                } catch (Exception e) {
+                    Msg.error(TabController.this, "Global auto-analyze failed: " + e.getMessage(), e);
+                    globalActionsTab.setProgressText("Error: " + e.getMessage());
+                } finally {
+                    if (summary != null) {
+                        globalActionsTab.setProgressText(String.format(
+                            "Done. candidates=%d proposals=%d applied=%d queued=%d failed=%d decompileFail=%d llmFail=%d",
+                            summary.candidatesConsidered, summary.proposalsProduced,
+                            applied[0], queued[0], failed[0], summary.decompileFailures, summary.llmFailures));
+                    }
+                    globalAnalyzeMonitor = null;
+                    globalAnalyzeRunning.set(false);
+                    globalActionsTab.setRunning(false);
+                }
+            }
+        };
+        JFrame parent = (plugin.getTool() == null) ? null : plugin.getTool().getToolFrame();
+        try {
+            new TaskLauncher(task, parent);
+        } catch (Exception launchEx) {
+            // Rollback run-state if launcher throws synchronously.
+            globalAnalyzeRunning.set(false);
+            globalActionsTab.setRunning(false);
+            Msg.error(this, "Failed to launch global auto-analyze: " + launchEx.getMessage(), launchEx);
+        }
+    }
+
+    public void handleStopGlobalAnalyze() {
+        globalStopRequested.set(true);
+        TaskMonitor monitor = globalAnalyzeMonitor;
+        if (monitor != null) {
+            monitor.cancel();
+        }
+    }
+
+    /** Snapshot of a selected row taken on the EDT before handoff to a background Task. */
+    private static final class ApplyRow {
+        final int index;
+        final String action;
+        final String argsJson;
+        ApplyRow(int index, String action, String argsJson) {
+            this.index = index;
+            this.action = action;
+            this.argsJson = argsJson;
+        }
+    }
+
+    public void handleApplyGlobalActions(JTable table) {
+        if (table == null) return;
+        final Program program = plugin.getCurrentProgram();
+        if (program == null) {
+            Msg.showInfo(getClass(), globalActionsTab, "No Program", "Open a program first.");
+            return;
+        }
+        final DefaultTableModel model = (DefaultTableModel) table.getModel();
+
+        // Snapshot selected rows on EDT before handoff to background thread.
+        // DefaultTableModel is not thread-safe; reading getValueAt/getRowCount off-EDT is undefined.
+        final List<ApplyRow> snapshot = new ArrayList<>();
+        try {
+            Runnable snapshotRunner = () -> {
+                int rowCount = model.getRowCount();
+                for (int r = 0; r < rowCount; r++) {
+                    Boolean sel = (Boolean) model.getValueAt(r, 0);
+                    if (sel == null || !sel) continue;
+                    Object actionObj = model.getValueAt(r, 3);
+                    Object argsObj = model.getValueAt(r, 6);
+                    snapshot.add(new ApplyRow(r,
+                        actionObj == null ? "" : actionObj.toString(),
+                        argsObj == null ? "" : argsObj.toString()));
+                }
+            };
+            if (SwingUtilities.isEventDispatchThread()) {
+                snapshotRunner.run();
+            } else {
+                SwingUtilities.invokeAndWait(snapshotRunner);
+            }
+        } catch (java.lang.reflect.InvocationTargetException | InterruptedException snapEx) {
+            if (snapEx instanceof InterruptedException) Thread.currentThread().interrupt();
+            Msg.error(this, "Failed to snapshot selected rows: " + snapEx.getMessage(), snapEx);
+            return;
+        }
+        if (snapshot.isEmpty()) {
+            Msg.showInfo(getClass(), globalActionsTab, "No Selection",
+                "Select at least one proposal to apply.");
+            return;
+        }
+
+        Task task = new Task("GhidrAssist Apply Selected Global Actions", true, true, false) {
+            @Override
+            public void run(TaskMonitor monitor) {
+                // Build struct signature registry off-EDT.
+                final StructSignatureRegistry structRegistry =
+                    new StructSignatureRegistry(program.getDataTypeManager());
+                try {
+                    structRegistry.buildFromDtm();
+                } catch (Exception regEx) {
+                    Msg.warn(TabController.this, "StructSignatureRegistry build failed: " + regEx.getMessage());
+                }
+
+                int applied = 0;
+                int failed = 0;
+                int total = snapshot.size();
+                int processed = 0;
+                for (ApplyRow row : snapshot) {
+                    if (monitor.isCancelled()) break;
+                    processed++;
+                    final int rowIdx = row.index;
+                    try {
+                        ActionExecutor.executeAction(row.action, row.argsJson, program, null,
+                            null, null, structRegistry);
+                        SwingUtilities.invokeLater(() -> model.setValueAt("applied", rowIdx, 5));
+                        applied++;
+                    } catch (Exception ex) {
+                        final String msg = "failed: " + ex.getMessage();
+                        SwingUtilities.invokeLater(() -> model.setValueAt(msg, rowIdx, 5));
+                        failed++;
+                    }
+                    monitor.setMessage(String.format("Applying... %d/%d", processed, total));
+                }
+                final int fApplied = applied;
+                final int fFailed = failed;
+                globalActionsTab.setProgressText(String.format(
+                    "Selected-apply done. applied=%d failed=%d", fApplied, fFailed));
+            }
+        };
+        JFrame parentApply = (plugin.getTool() == null) ? null : plugin.getTool().getToolFrame();
+        try {
+            new TaskLauncher(task, parentApply);
+        } catch (Exception launchEx) {
+            Msg.error(this, "Failed to launch selected-apply task: " + launchEx.getMessage(), launchEx);
+        }
+    }
+
+    private boolean routeProposal(Program program, GlobalAnalysisService.ProposedAction p,
+                                  GlobalAnalysisService.GlobalAnalysisConfig config,
+                                  StructSignatureRegistry structRegistry,
+                                  int[] applied, int[] failed) {
+        boolean auto;
+        if ("retype_variable".equals(p.action)) {
+            auto = p.confidence >= ActionConstants.RETYPE_CONFIDENCE_FLOOR - 1e-9;
+        } else if ("set_signature".equals(p.action)) {
+            auto = p.confidence >= ActionConstants.RETYPE_CONFIDENCE_FLOOR - 1e-9;
+        } else if ("auto_create_struct".equals(p.action)) {
+            auto = p.confidence >= config.autoApplyConfidence;
+        } else if ("rename_function".equals(p.action) || "rename_variable".equals(p.action)) {
+            int signals = p.evidence != null ? p.evidence.corroborationSignals() : 0;
+            auto = p.confidence >= config.autoApplyConfidence && signals >= 1;
+        } else {
+            auto = false;
+        }
+        if (!auto) return false;
+        try {
+            ActionExecutor.executeAction(p.action, p.argumentsJson, program, null,
+                null, null, structRegistry);
+            applied[0]++;
+            return true;
+        } catch (Exception e) {
+            failed[0]++;
+            Msg.warn(this, "Auto-apply failed for " + p.action + ": " + e.getMessage());
+            return false;
+        }
+    }
+
+    private void appendProposalRow(GlobalAnalysisService.ProposedAction p) {
+        DefaultTableModel model = (DefaultTableModel) globalActionsTab.getTable().getModel();
+        String targetLabel = p.target != null
+            ? (p.target.getName() + " @ " + p.target.getEntryPoint()) : "";
+        model.addRow(new Object[]{
+            Boolean.TRUE,
+            p.confidence,
+            targetLabel,
+            p.action,
+            p.description == null ? "" : p.description,
+            "pending",
+            p.argumentsJson == null ? "" : p.argumentsJson
+        });
+    }
+
+    private static String describeProgress(GlobalAnalysisService.ProposedAction p, int applied, int queued) {
+        return String.format("applied=%d queued=%d last=%s %s",
+            applied, queued, p.action, p.description == null ? "" : p.description);
+    }
+
+    /**
+     * Navigate the CodeBrowser to the address embedded in a Global Actions table row's
+     * Target cell. Target format: "{name} @ {address}". The {@code modelRow} must be a
+     * model-space index (sorter-translated by the caller).
+     */
+    /**
+     * Navigate the CodeBrowser to the address embedded in a Global Actions table row's
+     * Target cell. Target format: "{name} @ {address}". The {@code modelRow} must be a
+     * model-space index (sorter-translated by the caller).
+     */
+    public void handleGlobalActionsNavigate(int modelRow) {
+        if (globalActionsTab == null) return;
+        DefaultTableModel model = (DefaultTableModel) globalActionsTab.getTable().getModel();
+        if (modelRow < 0 || modelRow >= model.getRowCount()) return;
+        Object cell = model.getValueAt(modelRow, 2);
+        if (!(cell instanceof String)) return;
+        String target = (String) cell;
+        int idx = target.lastIndexOf(" @ ");
+        if (idx < 0) return;
+        String addrStr = target.substring(idx + 3).trim();
+        Program program = plugin.getCurrentProgram();
+        if (program == null || addrStr.isEmpty()) return;
+        try {
+            Address addr = program.getAddressFactory().getAddress(addrStr);
+            if (addr != null) navigateToAddress(addr);
+        } catch (Exception ex) {
+            Msg.warn(this, "Failed to parse target address '" + addrStr + "': " + ex.getMessage());
+        }
+    }
+
+    public void handleGlobalActionsApplyRow(int modelRow) {
+        if (globalActionsTab == null) return;
+        final Program program = plugin.getCurrentProgram();
+        if (program == null) {
+            Msg.showInfo(getClass(), globalActionsTab, "No Program", "Open a program first.");
+            return;
+        }
+        final DefaultTableModel model = (DefaultTableModel) globalActionsTab.getTable().getModel();
+        if (modelRow < 0 || modelRow >= model.getRowCount()) return;
+        final Object actionObj = model.getValueAt(modelRow, 3);
+        final Object argsObj = model.getValueAt(modelRow, 6);
+        final String action = actionObj == null ? "" : actionObj.toString();
+        final String argsJson = argsObj == null ? "" : argsObj.toString();
+        if (action.isEmpty()) return;
+
+        Task task = new Task("GhidrAssist Apply Row", true, true, false) {
+            @Override
+            public void run(TaskMonitor monitor) {
+                final StructSignatureRegistry structRegistry =
+                    new StructSignatureRegistry(program.getDataTypeManager());
+                try {
+                    structRegistry.buildFromDtm();
+                } catch (Exception regEx) {
+                    Msg.warn(TabController.this, "StructSignatureRegistry build failed: " + regEx.getMessage());
+                }
+                try {
+                    ActionExecutor.executeAction(action, argsJson, program, null,
+                        null, null, structRegistry);
+                    SwingUtilities.invokeLater(() -> {
+                        if (modelRow < model.getRowCount()) model.setValueAt("applied", modelRow, 5);
+                    });
+                } catch (Exception ex) {
+                    final String msg = "failed: " + ex.getMessage();
+                    SwingUtilities.invokeLater(() -> {
+                        if (modelRow < model.getRowCount()) model.setValueAt(msg, modelRow, 5);
+                    });
+                    Msg.warn(TabController.this, "Row apply failed for " + action + ": " + ex.getMessage());
+                }
+            }
+        };
+        JFrame parent = (plugin.getTool() == null) ? null : plugin.getTool().getToolFrame();
+        try {
+            new TaskLauncher(task, parent);
+        } catch (Exception launchEx) {
+            Msg.error(this, "Failed to launch row-apply task: " + launchEx.getMessage(), launchEx);
+        }
+    }
+
+    public void handleGlobalActionsRemoveRow(int modelRow) {
+        if (globalActionsTab == null) return;
+        final DefaultTableModel model = (DefaultTableModel) globalActionsTab.getTable().getModel();
+        Runnable r = () -> {
+            if (modelRow >= 0 && modelRow < model.getRowCount()) model.removeRow(modelRow);
+        };
+        if (SwingUtilities.isEventDispatchThread()) r.run();
+        else SwingUtilities.invokeLater(r);
+    }
+
+    // ==== Actions Tab single-row apply/remove (context menu) ====
+
+    /**
+     * Apply a single row from the Actions tab. Mirrors
+     * {@link ghidrassist.services.ActionAnalysisService#applyActions} for one row:
+     * action name (col 1, spaces normalised to underscores), arguments JSON (col 4),
+     * status written back to col 3. Runs at {@link GhidrAssistPlugin#getCurrentAddress()}.
+     */
+    public void handleActionsApplyRow(int modelRow) {
+        if (actionsTab == null) return;
+        final Program program = plugin.getCurrentProgram();
+        if (program == null) {
+            Msg.showInfo(getClass(), actionsTab, "No Program", "Open a program first.");
+            return;
+        }
+        final DefaultTableModel model = actionsTab.getTableModel();
+        if (modelRow < 0 || modelRow >= model.getRowCount()) return;
+        final Object actionObj = model.getValueAt(modelRow, 1);
+        final Object argsObj = model.getValueAt(modelRow, 4);
+        if (actionObj == null) return;
+        final String action = actionObj.toString().replace(" ", "_");
+        final String argsJson = argsObj == null ? "" : argsObj.toString();
+        if (action.isEmpty()) return;
+        final ghidra.program.model.address.Address address = plugin.getCurrentAddress();
+
+        Task task = new Task("GhidrAssist Apply Action Row", true, true, false) {
+            @Override
+            public void run(TaskMonitor monitor) {
+                try {
+                    ghidrassist.AnalysisDB analysisDB = new ghidrassist.AnalysisDB();
+                    String binaryId = program.getExecutableSHA256();
+                    ActionExecutor.executeAction(action, argsJson, program, address, analysisDB, binaryId);
+                    SwingUtilities.invokeLater(() -> {
+                        if (modelRow < model.getRowCount()) {
+                            model.setValueAt("Applied", modelRow, 3);
+                            model.setValueAt(Boolean.FALSE, modelRow, 0);
+                        }
+                    });
+                } catch (Exception ex) {
+                    final String msg = "Failed: " + ex.getMessage();
+                    SwingUtilities.invokeLater(() -> {
+                        if (modelRow < model.getRowCount()) model.setValueAt(msg, modelRow, 3);
+                    });
+                    Msg.warn(TabController.this, "Actions row apply failed for " + action + ": " + ex.getMessage());
+                }
+            }
+        };
+        JFrame parent = (plugin.getTool() == null) ? null : plugin.getTool().getToolFrame();
+        try {
+            new TaskLauncher(task, parent);
+        } catch (Exception launchEx) {
+            Msg.error(this, "Failed to launch actions row-apply task: " + launchEx.getMessage(), launchEx);
+        }
+    }
+
+    public void handleActionsRemoveRow(int modelRow) {
+        if (actionsTab == null) return;
+        final DefaultTableModel model = actionsTab.getTableModel();
+        Runnable r = () -> {
+            if (modelRow >= 0 && modelRow < model.getRowCount()) model.removeRow(modelRow);
+        };
+        if (SwingUtilities.isEventDispatchThread()) r.run();
+        else SwingUtilities.invokeLater(r);
+    }
 
     // ==== Cleanup ====
 

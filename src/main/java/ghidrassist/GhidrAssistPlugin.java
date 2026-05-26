@@ -17,6 +17,7 @@ import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.FunctionManager;
 import ghidra.program.model.listing.Program;
 import ghidra.program.util.ProgramLocation;
+import ghidra.program.util.ProgramSelection;
 import ghidrassist.apiprovider.APIProviderConfig;
 
 @PluginInfo(
@@ -57,8 +58,19 @@ public class GhidrAssistPlugin extends ProgramPlugin {
         }
     }
 
+    @Override
+    public void selectionChanged(ProgramSelection sel) {
+        if (provider != null) {
+            provider.getUI().updateSelection(sel);
+        }
+    }
+
     public Program getCurrentProgram() {
         return currentProgram;
+    }
+
+    public ProgramSelection getCurrentSelection() {
+        return currentSelection;
     }
 
     public Address getCurrentAddress() {

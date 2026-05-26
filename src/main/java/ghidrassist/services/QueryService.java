@@ -223,6 +223,20 @@ public class QueryService {
     public void executeQuery(QueryRequest request, LlmApi llmApi, LlmApi.LlmResponseHandler handler) throws Exception {
         attachContextWindowTracking(llmApi);
 
+        // Apply saved reasoning config to the LlmApi if it doesn't already have one set
+        if (llmApi.getReasoningConfig().getEffort() == ghidrassist.apiprovider.ReasoningConfig.EffortLevel.NONE) {
+            ghidra.program.model.listing.Program currentProgram = plugin.getCurrentProgram();
+            if (currentProgram != null) {
+                String programHash = currentProgram.getExecutableSHA256();
+                String savedEffort = analysisDB.getReasoningEffort(programHash);
+                if (savedEffort != null && !savedEffort.equalsIgnoreCase("none")) {
+                    ghidrassist.apiprovider.ReasoningConfig reasoningConfig =
+                            ghidrassist.apiprovider.ReasoningConfig.fromString(savedEffort);
+                    llmApi.setReasoningConfig(reasoningConfig);
+                }
+            }
+        }
+
         if (request.shouldUseMCP()) {
             try {
                 MCPToolManager toolManager = MCPToolManager.getInstance();

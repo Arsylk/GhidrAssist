@@ -129,6 +129,7 @@ public class ProviderRegistry {
         registerFactory(new AzureOpenAIProviderFactory());
         registerFactory(new GeminiOAuthProviderFactory());
         registerFactory(new GeminiPlatformApiProviderFactory());
+        registerFactory(new GoogleGenAIProviderFactory());
         registerFactory(new LiteLLMProviderFactory());
         registerFactory(new LMStudioProviderFactory());
         registerFactory(new OllamaProviderFactory());

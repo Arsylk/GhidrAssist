@@ -33,42 +33,43 @@ import java.util.stream.Collectors;
 @SuppressWarnings("deprecation")  // Uses legacy extractSecurityNotes() for backward compatibility
 public class SemanticExtractor {
 
-    private final APIProvider provider;
+    private volatile APIProvider provider;
     private final BinaryKnowledgeGraph graph;
-    private final ResponseProcessor responseProcessor = new ResponseProcessor();
-    @SuppressWarnings("unused")  // Reserved for future multi-binary support
     private final String binaryId;
     private final String systemPrompt;
-
-    // Parallel processing workers
-    private static final int PARALLEL_WORKERS = 3;
-
-    // Rate limiting (legacy - kept for compatibility)
-    private static final int DEFAULT_BATCH_SIZE = 5;
-    private static final long DEFAULT_DELAY_MS = 500;
-    @SuppressWarnings("unused")  // Legacy field kept for API compatibility
     private int batchSize;
-    @SuppressWarnings("unused")  // Legacy field kept for API compatibility
     private long delayBetweenBatches;
 
-    // Thread-safe statistics
-    private AtomicInteger summarized = new AtomicInteger(0);
-    private AtomicInteger embeddingsGenerated = new AtomicInteger(0);
-    private AtomicInteger errors = new AtomicInteger(0);
-    private AtomicInteger processed = new AtomicInteger(0);
+    private static final int DEFAULT_BATCH_SIZE = 5;
+    private static final long DEFAULT_DELAY_MS = 1000;
+    private static final int PARALLEL_WORKERS = 3;
 
-    // Cancellation
+    private final ResponseProcessor responseProcessor = new ResponseProcessor();
+
+    private final AtomicInteger summarized = new AtomicInteger(0);
+    private final AtomicInteger embeddingsGenerated = new AtomicInteger(0);
+    private final AtomicInteger errors = new AtomicInteger(0);
+    private final AtomicInteger processed = new AtomicInteger(0);
     private volatile boolean cancelled = false;
-    private ExecutorService executor;
+    private ExecutorService currentExecutor;
 
     /**
-     * Create a SemanticExtractor.
+     * Create a new semantic extractor.
      *
-     * @param provider LLM provider for summarization
-     * @param graph    Knowledge graph to update
+     * @param provider The LLM provider for summarization
+     * @param graph    The knowledge graph to update
      */
     public SemanticExtractor(APIProvider provider, BinaryKnowledgeGraph graph) {
-        this(provider, graph, "You are a binary analysis assistant. Provide concise, technical summaries focused on functionality and security.");
+        this(provider, graph, null);
+    }
+
+    /**
+     * Update the LLM provider.
+     *
+     * @param provider The new provider
+     */
+    public void setProvider(APIProvider provider) {
+        this.provider = provider;
     }
 
     public SemanticExtractor(APIProvider provider, BinaryKnowledgeGraph graph, String systemPrompt) {
@@ -153,7 +154,7 @@ public class SemanticExtractor {
                 }
 
                 final KnowledgeNode nodeToProcess = node;
-                Future<?> future = executor.submit(() -> {
+                Future<?> future = currentExecutor.submit(() -> {
                     try {
                         if (nodeToProcess.getType() == NodeType.FUNCTION) {
                             processSingleFunctionParallel(nodeToProcess);
@@ -208,12 +209,13 @@ public class SemanticExtractor {
             Msg.warn(this, "Interrupted during processing: " + e.getMessage());
             Thread.currentThread().interrupt();
         } finally {
-            executor.shutdownNow();
+            currentExecutor.shutdownNow();
             try {
-                executor.awaitTermination(5, TimeUnit.SECONDS);
+                currentExecutor.awaitTermination(5, TimeUnit.SECONDS);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
+            currentExecutor = null;
         }
 
         long elapsed = System.currentTimeMillis() - startTime;
@@ -319,8 +321,8 @@ public class SemanticExtractor {
      */
     public void cancel() {
         cancelled = true;
-        if (executor != null) {
-            executor.shutdownNow();
+        if (currentExecutor != null) {
+            currentExecutor.shutdownNow();
         }
     }
 

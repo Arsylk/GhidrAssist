@@ -50,6 +50,14 @@ public class LlmApiClient {
         initializeGraphRAGService();
     }
 
+    public LlmApiClient(APIProvider provider, GhidrAssistPlugin plugin) {
+        this.provider = provider;
+        this.analysisDB = new AnalysisDB();
+        this.plugin = plugin;
+
+        initializeGraphRAGService();
+    }
+
     /**
      * Initialize GraphRAGService with the LLM provider.
      * This enables background semantic analysis when tools trigger on-demand indexing.
@@ -137,9 +145,9 @@ public class LlmApiClient {
      */
     private boolean isO1OrO3Model() {
         return provider != null && (
-            provider.getModel().startsWith("o1-") || 
-            provider.getModel().startsWith("o3-") || 
-            provider.getModel().startsWith("o4-")
+            provider.getModel().startsWith("o1") || 
+            provider.getModel().startsWith("o3") || 
+            provider.getModel().startsWith("o4")
         );
     }
     

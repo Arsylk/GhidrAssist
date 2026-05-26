@@ -341,7 +341,7 @@ public class LiteLLMProvider extends OpenAIPlatformApiProvider {
     /**
      * Execute streaming with functions request with retry logic for rate limits and transient errors.
      */
-    private void executeStreamingFunctionsWithRetry(JsonObject payload, StreamingFunctionHandler handler,
+    protected void executeStreamingFunctionsWithRetry(JsonObject payload, StreamingFunctionHandler handler,
                                                     String operation, int attemptNumber) {
         if (isCancelled) {
             handler.onError(new StreamCancelledException(name, operation,
@@ -710,13 +710,16 @@ public class LiteLLMProvider extends OpenAIPlatformApiProvider {
     /**
      * Extract delta content from a streaming chunk.
      */
-    private String extractDeltaContent(JsonObject chunk) {
+    protected String extractDeltaContent(JsonObject chunk) {
         try {
-            JsonObject delta = chunk.getAsJsonArray("choices")
-                    .get(0).getAsJsonObject()
+            JsonArray choices = chunk.getAsJsonArray("choices");
+            if (choices == null || choices.size() == 0) {
+                return null;
+            }
+            JsonObject delta = choices.get(0).getAsJsonObject()
                     .getAsJsonObject("delta");
 
-            if (delta.has("content")) {
+            if (delta != null && delta.has("content") && !delta.get("content").isJsonNull()) {
                 return delta.get("content").getAsString();
             }
         } catch (Exception e) {

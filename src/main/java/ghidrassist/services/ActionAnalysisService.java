@@ -45,10 +45,10 @@ public class ActionAnalysisService {
         }
         
         String code = CodeUtils.getFunctionCode(function, TaskMonitor.DUMMY);
-        if (code == null) {
-            throw new Exception("Failed to get code from the current function.");
+        if (code == null || code.startsWith("Failed to decompile")) {
+            throw new Exception("Failed to decompile function '" + function.getName() + "'; cannot run action analysis.");
         }
-        
+
         return new ActionAnalysisRequest(function, code, selectedActions);
     }
     
@@ -190,10 +190,20 @@ public class ActionAnalysisService {
     }
     
     /**
-     * Parse and display action results
+     * Parse and display action results (legacy overload; no target stamping).
      */
     public void parseAndDisplayActions(String response, DefaultTableModel tableModel) throws Exception {
         ActionParser.parseAndDisplay(response, tableModel);
+    }
+
+    /**
+     * Parse and display action results with target-function stamping.
+     * The defaultTarget + program are threaded through so ActionParser can attach
+     * synthetic _target_entry_address / _target_func_name keys to each row's arguments JSON.
+     */
+    public void parseAndDisplayActions(String response, DefaultTableModel tableModel,
+                                       Function defaultTarget, Program program) throws Exception {
+        ActionParser.parseAndDisplay(response, tableModel, defaultTarget, program);
     }
     
     /**

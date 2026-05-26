@@ -16,25 +16,53 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonSyntaxException;
 import com.google.gson.stream.JsonReader;
 
+import ghidra.program.model.listing.Function;
+import ghidra.program.model.listing.FunctionManager;
+import ghidra.program.model.listing.Program;
+
 public class ActionParser {
     private static final Gson gson = new Gson();
-    
+
+    // Synthetic keys stamped into the arguments JSON so ActionExecutor can resolve
+    // the target function without relying on the cursor position. Prefixed with
+    // underscore so they can never collide with real schema fields. The entry
+    // address is serialized as a full Ghidra Address string (space:offset form)
+    // to remain unambiguous across segmented / overlay programs - a raw offset
+    // alone cannot round-trip through program.getAddressFactory().getAddress().
+    public static final String KEY_TARGET_ENTRY_ADDRESS = "_target_entry_address";
+    public static final String KEY_TARGET_FUNC_NAME = "_target_func_name";
+
     /**
      * Parse the LLM response and display actions in the table model.
-     * @param response Raw response from LLM
-     * @param model Table model to populate
-     * @throws Exception if parsing fails
+     * Backward-compatible entry point with no target context - actions parsed
+     * via this path will fall back to the cursor address at execution time.
      */
     public static void parseAndDisplay(String response, DefaultTableModel model) throws Exception {
+        parseAndDisplay(response, model, null, null);
+    }
+
+    /**
+     * Parse the LLM response and stamp the supplied default target function onto
+     * every action row. Intended for the per-function Analyze workflow where the
+     * LLM was prompted about exactly one function; the stamp ensures the Apply
+     * step still resolves the correct function even if the user navigates away.
+     *
+     * @param response Raw response from LLM
+     * @param model Table model to populate
+     * @param defaultTarget Default function to stamp when a tool_call omits func_name (nullable)
+     * @param programForLookup Program used to resolve func_name -> entry offset (nullable)
+     */
+    public static void parseAndDisplay(String response, DefaultTableModel model,
+                                       Function defaultTarget, Program programForLookup) throws Exception {
         String jsonStr = extractToolCallsJson(response);
         JsonObject jsonObject = parseJson(jsonStr);
-        
+
         if (!jsonObject.has("tool_calls")) {
             throw new Exception("Response does not contain 'tool_calls' field");
         }
-        
+
         JsonArray toolCallsArray = jsonObject.getAsJsonArray("tool_calls");
-        processToolCalls(toolCallsArray, model);
+        processToolCalls(toolCallsArray, model, defaultTarget, programForLookup);
     }
     
     /**
@@ -45,60 +73,62 @@ public class ActionParser {
         try {
             JsonObject responseObj = gson.fromJson(response, JsonObject.class);
 
-            // Check if this is already tool calls JSON
-            if (responseObj.has("tool_calls")) {
-                return response;
-            }
+            if (responseObj != null) {
+                // Check if this is already tool calls JSON
+                if (responseObj.has("tool_calls")) {
+                    return response;
+                }
 
-            // Check for OpenAI format: choices[].message.tool_calls
-            if (responseObj.has("choices")) {
-                JsonArray choices = responseObj.getAsJsonArray("choices");
-                if (choices.size() > 0) {
-                    JsonObject choice = choices.get(0).getAsJsonObject();
-                    if (choice.has("message")) {
-                        JsonObject message = choice.getAsJsonObject("message");
+                // Check for OpenAI format: choices[].message.tool_calls
+                if (responseObj.has("choices")) {
+                    JsonArray choices = responseObj.getAsJsonArray("choices");
+                    if (choices.size() > 0) {
+                        JsonObject choice = choices.get(0).getAsJsonObject();
+                        if (choice.has("message")) {
+                            JsonObject message = choice.getAsJsonObject("message");
 
-                        // OpenAI style tool_calls in message
-                        if (message.has("tool_calls")) {
-                            JsonArray toolCalls = message.getAsJsonArray("tool_calls");
-                            JsonObject result = new JsonObject();
-                            result.add("tool_calls", toolCalls);
-                            return gson.toJson(result);
-                        }
-
-                        // Anthropic/Bedrock style - content array with tool_use blocks
-                        if (message.has("content") && message.get("content").isJsonArray()) {
-                            JsonArray convertedToolCalls = convertAnthropicToolUseToToolCalls(
-                                    message.getAsJsonArray("content"));
-                            if (convertedToolCalls != null && convertedToolCalls.size() > 0) {
+                            // OpenAI style tool_calls in message
+                            if (message.has("tool_calls")) {
+                                JsonArray toolCalls = message.getAsJsonArray("tool_calls");
                                 JsonObject result = new JsonObject();
-                                result.add("tool_calls", convertedToolCalls);
+                                result.add("tool_calls", toolCalls);
                                 return gson.toJson(result);
+                            }
+
+                            // Anthropic/Bedrock style - content array with tool_use blocks
+                            if (message.has("content") && message.get("content").isJsonArray()) {
+                                JsonArray convertedToolCalls = convertAnthropicToolUseToToolCalls(
+                                        message.getAsJsonArray("content"));
+                                if (convertedToolCalls != null && convertedToolCalls.size() > 0) {
+                                    JsonObject result = new JsonObject();
+                                    result.add("tool_calls", convertedToolCalls);
+                                    return gson.toJson(result);
+                                }
                             }
                         }
                     }
                 }
-            }
 
-            // Check if this is an Anthropic response with content array at top level
-            if (responseObj.has("content") && responseObj.get("content").isJsonArray()) {
-                JsonArray contentArray = responseObj.getAsJsonArray("content");
+                // Check if this is an Anthropic response with content array at top level
+                if (responseObj.has("content") && responseObj.get("content").isJsonArray()) {
+                    JsonArray contentArray = responseObj.getAsJsonArray("content");
 
-                // First check for tool_use blocks (Anthropic native format)
-                JsonArray convertedToolCalls = convertAnthropicToolUseToToolCalls(contentArray);
-                if (convertedToolCalls != null && convertedToolCalls.size() > 0) {
-                    JsonObject result = new JsonObject();
-                    result.add("tool_calls", convertedToolCalls);
-                    return gson.toJson(result);
-                }
+                    // First check for tool_use blocks (Anthropic native format)
+                    JsonArray convertedToolCalls = convertAnthropicToolUseToToolCalls(contentArray);
+                    if (convertedToolCalls != null && convertedToolCalls.size() > 0) {
+                        JsonObject result = new JsonObject();
+                        result.add("tool_calls", convertedToolCalls);
+                        return gson.toJson(result);
+                    }
 
-                // Fall back to checking for text content with embedded JSON
-                if (contentArray.size() > 0) {
-                    JsonObject firstContent = contentArray.get(0).getAsJsonObject();
-                    if (firstContent.has("type") && "text".equals(firstContent.get("type").getAsString())
-                        && firstContent.has("text")) {
-                        String textContent = firstContent.get("text").getAsString();
-                        return preprocessJsonResponse(textContent);
+                    // Fall back to checking for text content with embedded JSON
+                    if (contentArray.size() > 0) {
+                        JsonObject firstContent = contentArray.get(0).getAsJsonObject();
+                        if (firstContent.has("type") && "text".equals(firstContent.get("type").getAsString())
+                            && firstContent.has("text")) {
+                            String textContent = firstContent.get("text").getAsString();
+                            return preprocessJsonResponse(textContent);
+                        }
                     }
                 }
             }
@@ -215,82 +245,113 @@ public class ActionParser {
      * Parse JSON string into JsonObject with lenient parsing.
      */
     private static JsonObject parseJson(String jsonStr) throws JsonSyntaxException {
+        if (jsonStr == null || jsonStr.trim().isEmpty()) {
+            throw new JsonSyntaxException("Empty JSON string");
+        }
         JsonReader jsonReader = new JsonReader(new StringReader(jsonStr));
         jsonReader.setLenient(true);
         JsonElement jsonElement = gson.fromJson(jsonReader, JsonElement.class);
         
-        if (!jsonElement.isJsonObject()) {
+        if (jsonElement == null || !jsonElement.isJsonObject()) {
             throw new JsonSyntaxException("Unexpected JSON structure in response");
         }
         
         return jsonElement.getAsJsonObject();
     }
     
-    /**
-     * Process tool calls array and populate table model.
-     */
-    private static void processToolCalls(JsonArray toolCallsArray, DefaultTableModel model) {
-        // Get list of valid function names
+    private static void processToolCalls(JsonArray toolCallsArray, DefaultTableModel model,
+                                         Function defaultTarget, Program programForLookup) {
         List<String> validFunctions = new ArrayList<>();
         for (Map<String, Object> fnTemplate : ActionConstants.FN_TEMPLATES) {
             @SuppressWarnings("unchecked")
             Map<String, Object> functionMap = (Map<String, Object>) fnTemplate.get("function");
             validFunctions.add(functionMap.get("name").toString());
         }
-        
-        // Process each tool call
+
         for (JsonElement toolCallElement : toolCallsArray) {
             if (!toolCallElement.isJsonObject()) {
                 continue;
             }
-            
+
             JsonObject toolCallObject;
             if (toolCallElement.getAsJsonObject().has("function")) {
             	toolCallObject = toolCallElement.getAsJsonObject().get("function").getAsJsonObject();
             } else {
             	toolCallObject = toolCallElement.getAsJsonObject();
             }
-            
-            // Validate tool call has required fields
+
             if (!toolCallObject.has("name") || !toolCallObject.has("arguments")) {
                 continue;
             }
-            
+
             String functionName = toolCallObject.get("name").getAsString();
             JsonObject arguments;
-            
-            // Handle arguments field - can be either JsonObject or JSON string
+
             JsonElement argumentsElement = toolCallObject.get("arguments");
             if (argumentsElement.isJsonObject()) {
                 arguments = argumentsElement.getAsJsonObject();
             } else if (argumentsElement.isJsonPrimitive()) {
-                // Parse JSON string (common in OpenAI responses)
                 try {
                     arguments = gson.fromJson(argumentsElement.getAsString(), JsonObject.class);
                 } catch (JsonSyntaxException e) {
-                    // If parsing fails, skip this tool call
                     continue;
                 }
             } else {
-                // Skip if arguments is neither object nor string
                 continue;
             }
-            
-            // Skip if function is not in our templates
+
             if (!validFunctions.contains(functionName)) {
                 continue;
             }
-            
-            // Add to actions table
+
+            stampTargetFunction(arguments, defaultTarget, programForLookup);
+
             Object[] rowData = new Object[]{
-                Boolean.FALSE,  // Initially unchecked
+                Boolean.FALSE,
                 functionName.replace("_", " "),
                 formatDescription(functionName, arguments),
-                "",  // Status
-                arguments.toString()  // Store full arguments JSON
+                "",
+                arguments.toString()
             };
             model.addRow(rowData);
         }
+    }
+
+    private static void stampTargetFunction(JsonObject arguments, Function defaultTarget,
+                                            Program programForLookup) {
+        Function resolved = null;
+
+        if (programForLookup != null && arguments.has("func_name")) {
+            JsonElement fn = arguments.get("func_name");
+            if (fn.isJsonPrimitive() && fn.getAsJsonPrimitive().isString()) {
+                String requestedName = fn.getAsString();
+                if (requestedName != null && !requestedName.isBlank()) {
+                    resolved = findFunctionByName(programForLookup, requestedName.strip());
+                }
+            }
+        }
+
+        if (resolved == null) {
+            resolved = defaultTarget;
+        }
+
+        if (resolved == null) {
+            return;
+        }
+
+        arguments.addProperty(KEY_TARGET_ENTRY_ADDRESS,
+            resolved.getEntryPoint().toString());
+        arguments.addProperty(KEY_TARGET_FUNC_NAME, resolved.getName());
+    }
+
+    private static Function findFunctionByName(Program program, String name) {
+        FunctionManager fm = program.getFunctionManager();
+        for (Function f : fm.getFunctions(true)) {
+            if (name.equals(f.getName())) {
+                return f;
+            }
+        }
+        return null;
     }
     
     /**
@@ -312,7 +373,26 @@ public class ActionParser {
                     
                 case "auto_create_struct":
                     return arguments.get("var_name").getAsString();
-                    
+
+                case "set_signature": {
+                    String ret = arguments.has("new_return_type") && !arguments.get("new_return_type").isJsonNull()
+                        ? arguments.get("new_return_type").getAsString() : "?";
+                    StringBuilder sb = new StringBuilder();
+                    sb.append(ret).append(" (");
+                    if (arguments.has("parameters") && arguments.get("parameters").isJsonArray()) {
+                        com.google.gson.JsonArray arr = arguments.getAsJsonArray("parameters");
+                        for (int i = 0; i < arr.size(); i++) {
+                            if (i > 0) sb.append(", ");
+                            com.google.gson.JsonObject p = arr.get(i).getAsJsonObject();
+                            String pt = p.has("type") && !p.get("type").isJsonNull() ? p.get("type").getAsString() : "?";
+                            String pn = p.has("name") && !p.get("name").isJsonNull() ? p.get("name").getAsString() : "?";
+                            sb.append(pt).append(" ").append(pn);
+                        }
+                    }
+                    sb.append(")");
+                    return sb.toString();
+                }
+
                 default:
                     return "";
             }

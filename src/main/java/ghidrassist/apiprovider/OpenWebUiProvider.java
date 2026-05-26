@@ -409,8 +409,18 @@ public class OpenWebUiProvider extends APIProvider implements FunctionCallingPro
                     JsonObject responseObj = gson.fromJson(responseBody.string(), JsonObject.class);
                     JsonArray embeddingsArray = responseObj.getAsJsonArray("embeddings");
 
+                    if (embeddingsArray == null || embeddingsArray.size() == 0) {
+                        callback.onError(new IOException("Empty embeddings in response"));
+                        return;
+                    }
 
-                    JsonArray embeddings = (JsonArray) embeddingsArray.get(0);
+                    JsonElement firstEmbedding = embeddingsArray.get(0);
+                    if (firstEmbedding == null || !firstEmbedding.isJsonArray()) {
+                        callback.onError(new IOException("First embedding is missing or not an array"));
+                        return;
+                    }
+
+                    JsonArray embeddings = firstEmbedding.getAsJsonArray();
                     double[] embeddingArray = new double[embeddings.size()];
                     for (int i = 0; i < embeddings.size(); i++) {
                         embeddingArray[i] = embeddings.get(i).getAsDouble();

@@ -19,6 +19,17 @@ public class APIProviderConfig {
     private boolean bypassProxy;
     private APIProvider.ProviderType type;
     private Integer timeout;
+    // Tri-state for ANTHROPIC_PLATFORM_API gateway compatibility:
+    //   null  -> auto-detect by host (anthropic.com => native, else adaptive)
+    //   true  -> force adaptive shape (thinking.type=adaptive + output_config.effort)
+    //   false -> force native shape (thinking.type=enabled + budget_tokens)
+    private Boolean useAdaptiveThinking;
+    // Optional override for the model used for embeddings. When null/empty, the
+    // provider picks a sensible default (auto-detected per endpoint where
+    // possible). Lets users running OpenAI-compatible endpoints that don't
+    // accept text-embedding-ada-002 (Gemini compat, LiteLLM, custom proxies)
+    // configure the correct embedding model without code changes.
+    private String embeddingModel;
 
     public APIProviderConfig(
             String name,
@@ -62,6 +73,8 @@ public class APIProviderConfig {
     public boolean isDisableTlsVerification() { return disableTlsVerification; }
     public boolean isBypassProxy() { return bypassProxy; }
     public Integer getTimeout() { return timeout; }
+    public Boolean getUseAdaptiveThinking() { return useAdaptiveThinking; }
+    public String getEmbeddingModel() { return embeddingModel; }
 
     // Setters
     public void setName(String name) { this.name = name; }
@@ -73,6 +86,12 @@ public class APIProviderConfig {
     public void setDisableTlsVerification(boolean disableTlsVerification) { this.disableTlsVerification = disableTlsVerification; }
     public void setBypassProxy(boolean bypassProxy) { this.bypassProxy = bypassProxy; }
     public void setTimeout(Integer timeout) { this.timeout = timeout != null ? timeout : DEFAULT_TIMEOUT; }
+    public void setUseAdaptiveThinking(Boolean useAdaptiveThinking) { this.useAdaptiveThinking = useAdaptiveThinking; }
+    public void setEmbeddingModel(String embeddingModel) {
+        this.embeddingModel = (embeddingModel != null && !embeddingModel.trim().isEmpty())
+            ? embeddingModel.trim()
+            : null;
+    }
 
     /**
      * Backfill missing fields from older serialized provider configs so they remain loadable.
@@ -125,7 +144,9 @@ public class APIProviderConfig {
      */
     public APIProvider createProvider() {
         try {
-            return ProviderRegistry.getInstance().createProvider(this);
+            APIProvider provider = ProviderRegistry.getInstance().createProvider(this);
+            provider.setUseAdaptiveThinking(this.useAdaptiveThinking);
+            return provider;
         } catch (UnsupportedProviderException e) {
             throw new IllegalArgumentException("Failed to create provider: " + e.getMessage(), e);
         }
@@ -136,7 +157,10 @@ public class APIProviderConfig {
      * @return new provider instance with identical configuration
      */
     public APIProviderConfig copy() {
-        return new APIProviderConfig(name, type, model, maxTokens, url, key, disableTlsVerification, bypassProxy, timeout);
+        APIProviderConfig c = new APIProviderConfig(name, type, model, maxTokens, url, key, disableTlsVerification, bypassProxy, timeout);
+        c.useAdaptiveThinking = this.useAdaptiveThinking;
+        c.embeddingModel = this.embeddingModel;
+        return c;
     }
     
     /**

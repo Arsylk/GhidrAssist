@@ -19,6 +19,7 @@ public class GhidrAssistUI extends JPanel {
     private final ExplainTab explainTab;
     private final QueryTab queryTab;
     private final ActionsTab actionsTab;
+    private final GlobalActionsTab globalActionsTab;
     private final RAGManagementTab ragManagementTab;
     private final SettingsTab settingsTab;
     private final SemanticGraphTab semanticGraphTab;
@@ -36,6 +37,7 @@ public class GhidrAssistUI extends JPanel {
         this.explainTab = new ExplainTab(controller);
         this.queryTab = new QueryTab(controller);
         this.actionsTab = new ActionsTab(controller);
+        this.globalActionsTab = new GlobalActionsTab(controller);
         this.ragManagementTab = new RAGManagementTab(controller);
         this.settingsTab = new SettingsTab(controller);
         this.semanticGraphTab = new SemanticGraphTab(controller);
@@ -45,6 +47,7 @@ public class GhidrAssistUI extends JPanel {
         controller.setExplainTab(explainTab);
         controller.setQueryTab(queryTab);
         controller.setActionsTab(actionsTab);
+        controller.setGlobalActionsTab(globalActionsTab);
         controller.setRAGManagementTab(ragManagementTab);
         controller.setSettingsTab(settingsTab);
         controller.setSemanticGraphTab(semanticGraphTab);
@@ -94,6 +97,10 @@ public class GhidrAssistUI extends JPanel {
             controller.updateSemanticGraphLocation(loc);
             controller.handleLocationUpdate(loc);  // Update line explanation display
         }
+    }
+
+    public void updateSelection(ProgramSelection sel) {
+        controller.handleSelectionUpdate(sel);
     }
 
     public JComponent getComponent() {

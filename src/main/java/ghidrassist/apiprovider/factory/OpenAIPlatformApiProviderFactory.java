@@ -15,7 +15,7 @@ public class OpenAIPlatformApiProviderFactory implements APIProviderFactory {
             throw new UnsupportedProviderException(config.getType(), getFactoryName());
         }
         
-        return new OpenAIPlatformApiProvider(
+        OpenAIPlatformApiProvider provider = new OpenAIPlatformApiProvider(
             config.getName(),
             config.getModel(),
             config.getMaxTokens(),
@@ -25,6 +25,8 @@ public class OpenAIPlatformApiProviderFactory implements APIProviderFactory {
             config.isBypassProxy(),
             config.getTimeout()
         );
+        provider.setEmbeddingModelOverride(config.getEmbeddingModel());
+        return provider;
     }
     
     @Override

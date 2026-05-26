@@ -370,9 +370,12 @@ public class AzureOpenAIProvider extends APIProvider
                 JsonObject responseObj = gson.fromJson(responseBody, JsonObject.class);
 
                 // Extract message from response (Azure OpenAI follows standard format)
-                JsonObject message = responseObj.getAsJsonArray("choices")
-                        .get(0).getAsJsonObject()
-                        .getAsJsonObject("message");
+                JsonArray choices = responseObj.getAsJsonArray("choices");
+                if (choices == null || choices.size() == 0) {
+                    throw new ResponseException(name, "createChatCompletionWithFunctions",
+                            ResponseException.ResponseErrorType.EMPTY_RESPONSE);
+                }
+                JsonObject message = choices.get(0).getAsJsonObject().getAsJsonObject("message");
 
                 // Check if tool_calls exists directly
                 if (message.has("tool_calls") && !message.get("tool_calls").isJsonNull()) {
@@ -513,11 +516,11 @@ public class AzureOpenAIProvider extends APIProvider
 
                 try {
                     String responseBody = response.body().string();
-                    JsonObject responseObj = gson.fromJson(responseBody, JsonObject.class);
-                    JsonArray dataArray = responseObj.getAsJsonArray("data");
+                JsonObject responseObj = gson.fromJson(responseBody, JsonObject.class);
+                JsonArray dataArray = responseObj.getAsJsonArray("data");
 
-                    if (dataArray.size() > 0) {
-                        JsonArray embeddingArray = dataArray.get(0).getAsJsonObject().getAsJsonArray("embedding");
+                if (dataArray != null && dataArray.size() > 0) {
+                    JsonArray embeddingArray = dataArray.get(0).getAsJsonObject().getAsJsonArray("embedding");
                         double[] embedding = new double[embeddingArray.size()];
 
                         for (int i = 0; i < embeddingArray.size(); i++) {
@@ -580,13 +583,18 @@ public class AzureOpenAIProvider extends APIProvider
     private JsonObject buildChatCompletionPayload(List<ChatMessage> messages, boolean stream) {
         JsonObject payload = new JsonObject();
 
-        // Handle different token field names based on model
+        // Handle different token field names based on model.
+        // Reasoning models (o1, o3, o4, gpt-5 families) require
+        // max_completion_tokens; max_tokens is rejected with 400.
         String modelName = super.getModel();
-        if (modelName != null
-                && (modelName.startsWith("o1-") || modelName.startsWith("o3-") || modelName.startsWith("o4-") || modelName.startsWith("gpt-5"))) {
-            payload.addProperty("max_completion_tokens", super.getMaxTokens());
+        boolean isReasoningModel = modelName != null &&
+            (modelName.startsWith("o1") || modelName.startsWith("o3") ||
+             modelName.startsWith("o4") || modelName.startsWith("gpt-5"));
+        Integer tokenLimit = super.getMaxTokens();
+        if (isReasoningModel) {
+            payload.addProperty("max_completion_tokens", tokenLimit);
         } else {
-            payload.addProperty("max_tokens", super.getMaxTokens());
+            payload.addProperty("max_tokens", tokenLimit != null ? tokenLimit : 16384);
         }
 
         payload.addProperty("stream", stream);
@@ -775,9 +783,11 @@ public class AzureOpenAIProvider extends APIProvider
     }
 
     private String extractContentFromResponse(JsonObject responseObj) {
-        JsonObject message = responseObj.getAsJsonArray("choices")
-                .get(0).getAsJsonObject()
-                .getAsJsonObject("message");
+        JsonArray choices = responseObj.getAsJsonArray("choices");
+        if (choices == null || choices.size() == 0) {
+            return "";
+        }
+        JsonObject message = choices.get(0).getAsJsonObject().getAsJsonObject("message");
 
         // Check if content exists and is not null
         if (message.has("content") && !message.get("content").isJsonNull()) {
@@ -791,9 +801,11 @@ public class AzureOpenAIProvider extends APIProvider
 
     private String extractDeltaContent(JsonObject chunk) {
         try {
-            JsonObject delta = chunk.getAsJsonArray("choices")
-                    .get(0).getAsJsonObject()
-                    .getAsJsonObject("delta");
+            JsonArray choices = chunk.getAsJsonArray("choices");
+            if (choices == null || choices.size() == 0) {
+                return null;
+            }
+            JsonObject delta = choices.get(0).getAsJsonObject().getAsJsonObject("delta");
 
             if (delta.has("content") && !delta.get("content").isJsonNull()) {
                 return delta.get("content").getAsString();

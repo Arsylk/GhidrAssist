@@ -23,27 +23,66 @@ import java.util.List;
 import java.util.Map;
 
 public class OpenAIPlatformApiProvider extends APIProvider implements FunctionCallingProvider, ModelListProvider, EmbeddingProvider {
-    private static final Gson gson = new Gson();
-    private static final MediaType JSON = MediaType.get("application/json; charset=utf-8");
-    private static final String OPENAI_CHAT_ENDPOINT = "chat/completions";
-    private static final String OPENAI_MODELS_ENDPOINT = "models";
-    private static final String OPENAI_EMBEDDINGS_ENDPOINT = "embeddings";
-    private static final String OPENAI_EMBEDDING_MODEL = "text-embedding-ada-002";
+    protected static final Gson gson = new Gson();
+    protected static final MediaType JSON = MediaType.get("application/json; charset=utf-8");
+    protected static final String OPENAI_CHAT_ENDPOINT = "chat/completions";
+    protected static final String OPENAI_MODELS_ENDPOINT = "models";
+    protected static final String OPENAI_EMBEDDINGS_ENDPOINT = "embeddings";
+    protected static final String OPENAI_EMBEDDING_MODEL = "text-embedding-ada-002";
 
     // Retry settings for streaming calls
     private static final int MAX_STREAMING_RETRIES = 10;
     private static final int MIN_RETRY_BACKOFF_MS = 10000;  // 10 seconds
     private static final int MAX_RETRY_BACKOFF_MS = 30000;  // 30 seconds
 
-    private volatile boolean isCancelled = false;
+    protected volatile boolean isCancelled = false;
+    /** Optional user-configured override. Null/empty means "use default selection". */
+    protected String embeddingModelOverride;
 
     public OpenAIPlatformApiProvider(String name, String model, Integer maxTokens, String url, String key,
                                      boolean disableTlsVerification, boolean bypassProxy, Integer timeout) {
         super(name, ProviderType.OPENAI_PLATFORM_API, model, maxTokens, url, key, disableTlsVerification, bypassProxy, timeout);
     }
 
+    public void setEmbeddingModelOverride(String embeddingModel) {
+        this.embeddingModelOverride = (embeddingModel != null && !embeddingModel.trim().isEmpty())
+            ? embeddingModel.trim()
+            : null;
+    }
+
+    /**
+     * Resolve which embedding model to send. Priority:
+     *   1. Explicit override from config (embeddingModel field)
+     *   2. Endpoint-based auto-detection (Gemini compat layer => text-embedding-004)
+     *   3. OPENAI_EMBEDDING_MODEL default
+     */
+    protected String resolveEmbeddingModel() {
+        if (embeddingModelOverride != null && !embeddingModelOverride.isEmpty()) {
+            return embeddingModelOverride;
+        }
+        String u = this.url != null ? this.url.toLowerCase() : "";
+        if (u.contains("generativelanguage.googleapis.com")
+                || u.contains("/gemini/")
+                || u.contains("/google/")) {
+            // Gemini's OpenAI-compatible embeddings endpoint accepts
+            // text-embedding-004 (latest) / gemini-embedding-001.
+            return "text-embedding-004";
+        }
+        return OPENAI_EMBEDDING_MODEL;
+    }
+
+    /**
+     * Build a POST Request for the given OpenAI-style endpoint and payload.
+     */
+    protected Request buildPostRequestForEndpoint(String endpoint, JsonObject payload) {
+        return new Request.Builder()
+            .url(this.url + endpoint)
+            .post(RequestBody.create(gson.toJson(payload), JSON))
+            .build();
+    }
+
     public static OpenAIPlatformApiProvider fromConfig(APIProviderConfig config) {
-        return new OpenAIPlatformApiProvider(
+        OpenAIPlatformApiProvider p = new OpenAIPlatformApiProvider(
             config.getName(),
             config.getModel(),
             config.getMaxTokens(),
@@ -53,6 +92,8 @@ public class OpenAIPlatformApiProvider extends APIProvider implements FunctionCa
             config.isBypassProxy(),
             config.getTimeout()
         );
+        p.setEmbeddingModelOverride(config.getEmbeddingModel());
+        return p;
     }
 
     @Override
@@ -106,10 +147,7 @@ public class OpenAIPlatformApiProvider extends APIProvider implements FunctionCa
     public String createChatCompletion(List<ChatMessage> messages) throws APIProviderException {
         JsonObject payload = buildChatCompletionPayload(messages, false);
         
-        Request request = new Request.Builder()
-            .url(url + OPENAI_CHAT_ENDPOINT)
-            .post(RequestBody.create(gson.toJson(payload), JSON))
-            .build();
+        Request request = buildPostRequestForEndpoint(OPENAI_CHAT_ENDPOINT, payload);
 
         try (Response response = executeWithRetry(request, "createChatCompletion")) {
             String responseBody = response.body().string();
@@ -142,10 +180,7 @@ public class OpenAIPlatformApiProvider extends APIProvider implements FunctionCa
             return;
         }
 
-        Request request = new Request.Builder()
-            .url(url + OPENAI_CHAT_ENDPOINT)
-            .post(RequestBody.create(gson.toJson(payload), JSON))
-            .build();
+        Request request = buildPostRequestForEndpoint(OPENAI_CHAT_ENDPOINT, payload);
 
         client.newCall(request).enqueue(new Callback() {
             private boolean isFirst = true;
@@ -226,6 +261,8 @@ public class OpenAIPlatformApiProvider extends APIProvider implements FunctionCa
                         } else if (!handler.shouldContinue()) {
                             handler.onError(new StreamCancelledException(name, operation,
                                 StreamCancelledException.CancellationReason.USER_REQUESTED));
+                        } else {
+                            handler.onComplete(contentBuilder.toString());
                         }
                     } catch (IOException e) {
                         handler.onError(new ResponseException(name, operation,
@@ -309,10 +346,7 @@ public class OpenAIPlatformApiProvider extends APIProvider implements FunctionCa
         payload.addProperty("tool_choice",
             (toolChoiceMode != null ? toolChoiceMode : ToolChoiceMode.AUTO).toOpenAIToolChoice(messages));
         
-        Request request = new Request.Builder()
-            .url(url + OPENAI_CHAT_ENDPOINT)
-            .post(RequestBody.create(gson.toJson(payload), JSON))
-            .build();
+        Request request = buildPostRequestForEndpoint(OPENAI_CHAT_ENDPOINT, payload);
 
         try (Response response = executeWithRetry(request, "createChatCompletionWithFunctionsFullResponse")) {
             String responseBody = response.body().string();
@@ -340,14 +374,11 @@ public class OpenAIPlatformApiProvider extends APIProvider implements FunctionCa
         payload.addProperty("tool_choice",
             (toolChoiceMode != null ? toolChoiceMode : ToolChoiceMode.AUTO).toOpenAIToolChoice(messages));
 
-        Request request = new Request.Builder()
-            .url(url + OPENAI_CHAT_ENDPOINT)
-            .post(RequestBody.create(gson.toJson(payload), JSON))
-            .build();
+        Request request = buildPostRequestForEndpoint(OPENAI_CHAT_ENDPOINT, payload);
 
         try (Response response = executeWithRetry(request, "createChatCompletionWithFunctions")) {
             String responseBody = response.body().string();
-            StringReader responseStr = new StringReader(responseBody.replaceFirst("```json", "").replaceAll("```", ""));
+            StringReader responseStr = new StringReader(responseBody.replaceFirst("```json", "{").replaceFirst("```$", "}"));
             
             try {
                 // Create a lenient JsonReader
@@ -355,13 +386,20 @@ public class OpenAIPlatformApiProvider extends APIProvider implements FunctionCa
                 jsonReader.setLenient(true);
 
                 // Parse with lenient reader
-                JsonObject responseObj = JsonParser.parseReader(jsonReader).getAsJsonObject();
+                JsonElement responseElem = JsonParser.parseReader(jsonReader);
+                if (responseElem == null || !responseElem.isJsonObject()) {
+                    throw new ResponseException(name, "createChatCompletionWithFunctions", 
+                        ResponseException.ResponseErrorType.EMPTY_RESPONSE);
+                }
+                JsonObject responseObj = responseElem.getAsJsonObject();
             JsonObject message = new JsonObject();
             if ( responseObj.has("message") ) {
             	message = responseObj.getAsJsonObject("message");
             } else if ( responseObj.has("choices") ) {
             	JsonArray choices = responseObj.getAsJsonArray("choices");
-            	message = choices.get(0).getAsJsonObject().getAsJsonObject("message");
+                if (choices != null && choices.size() > 0) {
+            	    message = choices.get(0).getAsJsonObject().getAsJsonObject("message");
+                }
             }
 
             // Check if tool_calls exists directly
@@ -446,7 +484,10 @@ public class OpenAIPlatformApiProvider extends APIProvider implements FunctionCa
     public List<String> getAvailableModels() throws APIProviderException {
         APIProviderException lastError = null;
 
+        ghidra.util.Msg.info(this, "Fetching models for provider: " + name + " (URL: " + url + ")");
+
         for (String endpoint : getModelsEndpointCandidates()) {
+            ghidra.util.Msg.info(this, "Trying models endpoint: " + endpoint);
             Request request = new Request.Builder()
                 .url(endpoint)
                 .header("Accept", "application/json")
@@ -454,6 +495,60 @@ public class OpenAIPlatformApiProvider extends APIProvider implements FunctionCa
                 .build();
 
             try (Response response = client.newCall(request).execute()) {
+                String responseBody = response.body() != null ? response.body().string() : "";
+                ghidra.util.Msg.info(this, "Model discovery response code: " + response.code());
+                String formattedResponse = responseBody.replaceAll("\\s+", " ").trim();
+if (formattedResponse.length() > 500) {
+    formattedResponse = formattedResponse.substring(0, 500) + "... [truncated]";
+}
+ghidra.util.Msg.info(this, "Model discovery response body (single-line): " + formattedResponse);
+List<String> modelDetails = new ArrayList<>();
+try {
+    JsonElement parsedResponse = JsonParser.parseString(responseBody);
+    if (parsedResponse.isJsonObject()) {
+        JsonObject jsonResponse = parsedResponse.getAsJsonObject();
+        JsonArray models = jsonResponse.getAsJsonArray("data");
+if (models == null && jsonResponse.has("models") && jsonResponse.get("models").isJsonArray()) {
+    models = jsonResponse.getAsJsonArray("models");
+    ghidra.util.Msg.warn(this, "'data' missing. Using 'models'.");
+}
+        if (models != null) {
+            models.forEach(model -> {
+                if (!model.isJsonObject()) {
+                    ghidra.util.Msg.warn(this, "Malformed model entry (not an object): " + model);
+                    return;
+                }
+                JsonObject modelObj = model.getAsJsonObject();
+                
+                // Try multiple possible field names for model identifier
+                String modelId = null;
+                if (modelObj.has("id")) {
+                    modelId = modelObj.get("id").getAsString();
+                } else if (modelObj.has("name")) {
+                    modelId = modelObj.get("name").getAsString();
+                } else if (modelObj.has("model")) {
+                    modelId = modelObj.get("model").getAsString();
+                } else if (modelObj.has("model_id")) {
+                    modelId = modelObj.get("model_id").getAsString();
+                }
+                
+                if (modelId != null && !modelId.isEmpty()) {
+                    modelDetails.add(modelId);
+                    ghidra.util.Msg.info(this, "Parsed model: ID=" + modelId);
+                } else {
+                    ghidra.util.Msg.warn(this, "Malformed model entry (no identifier field): " + model);
+                }
+            });
+        } else {
+            ghidra.util.Msg.warn(this, "No 'data' array in response: " + jsonResponse);
+        }
+    } else {
+        ghidra.util.Msg.warn(this, "Unexpected response format: " + parsedResponse);
+    }
+} catch (JsonSyntaxException e) {
+    ghidra.util.Msg.error(this, "Failed to parse JSON response", e);
+}
+
                 if (response.code() == 401 || response.code() == 403) {
                     throw handleHttpError(response, "getAvailableModels");
                 }
@@ -463,9 +558,9 @@ public class OpenAIPlatformApiProvider extends APIProvider implements FunctionCa
                     continue;
                 }
 
-                String responseBody = response.body() != null ? response.body().string() : "";
                 List<String> modelIds = extractModelIdsFromResponse(responseBody);
                 if (!modelIds.isEmpty()) {
+                    ghidra.util.Msg.info(this, "Successfully found " + modelIds.size() + " models");
                     return modelIds;
                 }
 
@@ -525,14 +620,41 @@ public class OpenAIPlatformApiProvider extends APIProvider implements FunctionCa
             }
 
             JsonObject responseObj = parsed.getAsJsonObject();
-            JsonArray models = responseObj.has("data") && responseObj.get("data").isJsonArray()
-                ? responseObj.getAsJsonArray("data")
-                : new JsonArray();
+JsonArray models;
+if (responseObj.has("data") && responseObj.get("data").isJsonArray()) {
+    models = responseObj.getAsJsonArray("data");
+    ghidra.util.Msg.info(this, "Models found under 'data' key");
+} else if (responseObj.has("models") && responseObj.get("models").isJsonArray()) {
+    models = responseObj.getAsJsonArray("models");
+    ghidra.util.Msg.warn(this, "'data' key missing. Falling back to 'models' key.");
+} else {
+    models = new JsonArray();
+    ghidra.util.Msg.error(this, "Invalid response format: neither 'data' nor 'models' key found.");
+}
 
             List<String> modelIds = new ArrayList<>();
             for (JsonElement model : models) {
-                if (model.isJsonObject() && model.getAsJsonObject().has("id")) {
-                    modelIds.add(model.getAsJsonObject().get("id").getAsString());
+                if (!model.isJsonObject()) {
+                    continue;
+                }
+                JsonObject modelObj = model.getAsJsonObject();
+                
+                // Try multiple possible field names for model identifier
+                String modelId = null;
+                if (modelObj.has("id")) {
+                    modelId = modelObj.get("id").getAsString();
+                } else if (modelObj.has("name")) {
+                    modelId = modelObj.get("name").getAsString();
+                } else if (modelObj.has("model")) {
+                    modelId = modelObj.get("model").getAsString();
+                } else if (modelObj.has("model_id")) {
+                    modelId = modelObj.get("model_id").getAsString();
+                }
+                
+                if (modelId != null && !modelId.isEmpty()) {
+                    modelIds.add(modelId);
+                } else {
+                    ghidra.util.Msg.warn(this, "Malformed model entry (no identifier field): " + model);
                 }
             }
             return modelIds;
@@ -545,7 +667,7 @@ public class OpenAIPlatformApiProvider extends APIProvider implements FunctionCa
     @Override
     public void getEmbeddingsAsync(String text, EmbeddingCallback callback) {
         JsonObject payload = new JsonObject();
-        payload.addProperty("model", OPENAI_EMBEDDING_MODEL);
+        payload.addProperty("model", resolveEmbeddingModel());
         payload.addProperty("input", text);
         executeEmbeddingsWithRetry(payload, callback, "get_embeddings", 0);
     }
@@ -675,16 +797,22 @@ public class OpenAIPlatformApiProvider extends APIProvider implements FunctionCa
         }, "OpenAIPlatformApiProvider-EmbeddingsRetry").start();
     }
 
-    private JsonObject buildChatCompletionPayload(List<ChatMessage> messages, boolean stream) {
+    protected JsonObject buildChatCompletionPayload(List<ChatMessage> messages, boolean stream) {
         JsonObject payload = new JsonObject();
         payload.addProperty("model", super.getModel());
 
-        // Handle different token field names based on model
+        // Handle different token field names based on model.
+        // Reasoning models (o1, o3, o4, gpt-5 families) require
+        // max_completion_tokens; max_tokens is rejected with 400.
         String modelName = super.getModel();
-        if (modelName != null && (modelName.startsWith("o1-") || modelName.startsWith("o3-") || modelName.startsWith("o4-") || modelName.startsWith("gpt-5"))) {
-            payload.addProperty("max_completion_tokens", super.getMaxTokens());
+        boolean isReasoningModel = modelName != null &&
+            (modelName.startsWith("o1") || modelName.startsWith("o3") ||
+             modelName.startsWith("o4") || modelName.startsWith("gpt-5"));
+        Integer tokenLimit = super.getMaxTokens();
+        if (isReasoningModel) {
+            payload.addProperty("max_completion_tokens", tokenLimit);
         } else {
-            payload.addProperty("max_tokens", super.getMaxTokens());
+            payload.addProperty("max_tokens", tokenLimit != null ? tokenLimit : 16384);
         }
         
         payload.addProperty("stream", stream);
@@ -886,19 +1014,30 @@ public class OpenAIPlatformApiProvider extends APIProvider implements FunctionCa
     }
 
     private String extractContentFromResponse(JsonObject responseObj) {
-        return responseObj.getAsJsonArray("choices")
-            .get(0).getAsJsonObject()
-            .getAsJsonObject("message")
-            .get("content").getAsString();
+        JsonArray choices = responseObj.getAsJsonArray("choices");
+        if (choices == null || choices.size() == 0) {
+            return "";
+        }
+        JsonObject choice = choices.get(0).getAsJsonObject();
+        if (choice.has("message") && choice.get("message").isJsonObject()) {
+            JsonObject message = choice.getAsJsonObject("message");
+            if (message.has("content") && !message.get("content").isJsonNull()) {
+                return message.get("content").getAsString();
+            }
+        }
+        return "";
     }
 
-    private String extractDeltaContent(JsonObject chunk) {
+    protected String extractDeltaContent(JsonObject chunk) {
         try {
-            JsonObject delta = chunk.getAsJsonArray("choices")
-                .get(0).getAsJsonObject()
+            JsonArray choices = chunk.getAsJsonArray("choices");
+            if (choices == null || choices.size() == 0) {
+                return null;
+            }
+            JsonObject delta = choices.get(0).getAsJsonObject()
                 .getAsJsonObject("delta");
             
-            if (delta.has("content")) {
+            if (delta != null && delta.has("content") && !delta.get("content").isJsonNull()) {
                 return delta.get("content").getAsString();
             }
         } catch (Exception e) {
@@ -981,7 +1120,7 @@ public class OpenAIPlatformApiProvider extends APIProvider implements FunctionCa
     /**
      * Execute streaming with functions request with retry logic for rate limits and transient errors.
      */
-    private void executeStreamingFunctionsWithRetry(JsonObject payload, StreamingFunctionHandler handler,
+    protected void executeStreamingFunctionsWithRetry(JsonObject payload, StreamingFunctionHandler handler,
                                                     String operation, int attemptNumber) {
         if (isCancelled) {
             handler.onError(new StreamCancelledException(name, operation,
@@ -989,10 +1128,7 @@ public class OpenAIPlatformApiProvider extends APIProvider implements FunctionCa
             return;
         }
 
-        Request request = new Request.Builder()
-            .url(url + OPENAI_CHAT_ENDPOINT)
-            .post(RequestBody.create(gson.toJson(payload), JSON))
-            .build();
+        Request request = buildPostRequestForEndpoint(OPENAI_CHAT_ENDPOINT, payload);
 
         client.newCall(request).enqueue(new Callback() {
             @Override
@@ -1013,17 +1149,28 @@ public class OpenAIPlatformApiProvider extends APIProvider implements FunctionCa
 
             @Override
             public void onResponse(Call call, Response response) throws IOException {
-                try (ResponseBody responseBody = response.body()) {
-                    if (!response.isSuccessful()) {
-                        APIProviderException error = handleHttpError(response, operation);
-                        if (shouldRetryStreaming(error, attemptNumber)) {
-                            retryStreamingFunctionsAfterDelay(payload, handler, operation, attemptNumber, error);
-                        } else {
-                            handler.onError(error);
-                        }
-                        return;
+                if (!response.isSuccessful()) {
+                    // Read the raw response body for diagnostics before handleHttpError consumes it
+                    String rawBody = null;
+                    ResponseBody errorBody = response.body();
+                    if (errorBody != null) {
+                        try { rawBody = errorBody.string(); } catch (IOException ignored) { }
                     }
+                    if (response.code() >= 400 && response.code() < 500) {
+                        ghidra.util.Msg.error(OpenAIPlatformApiProvider.this,
+                            "API error " + response.code() + " for " + operation + ": " +
+                            (rawBody != null ? rawBody : "(no body)"));
+                    }
+                    APIProviderException error = handleHttpError(response, rawBody, operation);
+                    if (shouldRetryStreaming(error, attemptNumber)) {
+                        retryStreamingFunctionsAfterDelay(payload, handler, operation, attemptNumber, error);
+                    } else {
+                        handler.onError(error);
+                    }
+                    return;
+                }
 
+                try (ResponseBody responseBody = response.body()) {
                     if (responseBody == null) {
                         handler.onError(new ResponseException(name, operation,
                             ResponseException.ResponseErrorType.EMPTY_RESPONSE));
@@ -1141,6 +1288,15 @@ public class OpenAIPlatformApiProvider extends APIProvider implements FunctionCa
                         } else if (!handler.shouldContinue()) {
                             handler.onError(new StreamCancelledException(name, operation,
                                 StreamCancelledException.CancellationReason.USER_REQUESTED));
+                        } else {
+                            java.util.List<ToolCall> finalToolCalls = new java.util.ArrayList<>();
+                            for (ToolCallAccumulator acc : toolCallsMap.values()) {
+                                if (acc.name != null && acc.id != null) {
+                                    finalToolCalls.add(new ToolCall(acc.id, acc.name, acc.argumentsBuffer.toString()));
+                                }
+                            }
+                            finishReason = normalizeFinishReasonForToolCalls(finishReason, finalToolCalls);
+                            handler.onStreamComplete(finishReason, textBuilder.toString(), finalToolCalls);
                         }
                     } catch (IOException e) {
                         handler.onError(new ResponseException(name, operation,
@@ -1175,6 +1331,42 @@ public class OpenAIPlatformApiProvider extends APIProvider implements FunctionCa
                     StreamCancelledException.CancellationReason.USER_REQUESTED));
             }
         }, "OpenAIPlatformApiProvider-StreamFunctionsRetry").start();
+    }
+
+    /**
+     * Normalize stream finish_reason when tool calls were produced.
+     *
+     * Some OpenAI-compatible endpoints (notably Gemini's compat layer, some
+     * litellm proxies, and self-hosted models) emit complete tool_calls deltas
+     * but never set finish_reason="tool_calls" — they leave it as "stop" or
+     * never send it at all. Without this normalization the downstream handler
+     * discards the tool calls and the agent conversation stalls.
+     *
+     * If at least one well-formed tool call (non-blank name) is present and
+     * the provider reported a non-tool finish_reason, upgrade it to
+     * "tool_calls" so the handler executes them.
+     */
+    protected static String normalizeFinishReasonForToolCalls(String finishReason, java.util.List<ToolCall> toolCalls) {
+        if (toolCalls == null || toolCalls.isEmpty()) {
+            return finishReason;
+        }
+        if ("tool_calls".equals(finishReason) || "function_call".equals(finishReason)) {
+            return finishReason;
+        }
+        boolean hasValidCall = false;
+        for (ToolCall tc : toolCalls) {
+            if (tc != null && tc.name != null && !tc.name.isEmpty()) {
+                hasValidCall = true;
+                break;
+            }
+        }
+        if (!hasValidCall) {
+            return finishReason;
+        }
+        ghidra.util.Msg.info(OpenAIPlatformApiProvider.class,
+            "Normalizing stream finish_reason from '" + finishReason + "' to 'tool_calls' (" +
+            toolCalls.size() + " tool calls present)");
+        return "tool_calls";
     }
 
     /**

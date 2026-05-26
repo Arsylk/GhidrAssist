@@ -394,7 +394,7 @@ public class GeminiOAuthProvider extends APIProvider implements FunctionCallingP
                                 JsonArray candidates = unwrapped.has("candidates")
                                     ? unwrapped.getAsJsonArray("candidates") : null;
 
-                                if (candidates != null && candidates.size() > 0) {
+                                if (candidates != null && candidates.size() > 0 && !candidates.get(0).isJsonNull()) {
                                     JsonObject firstCandidate = candidates.get(0).getAsJsonObject();
                                     if (firstCandidate.has("content") && firstCandidate.get("content").isJsonObject()) {
                                         JsonArray parts = firstCandidate.getAsJsonObject("content")
@@ -736,7 +736,7 @@ public class GeminiOAuthProvider extends APIProvider implements FunctionCallingP
         JsonArray candidates = responseData.has("candidates")
             ? responseData.getAsJsonArray("candidates") : new JsonArray();
 
-        if (candidates.size() > 0) {
+        if (candidates != null && candidates.size() > 0 && !candidates.get(0).isJsonNull()) {
             JsonObject firstCandidate = candidates.get(0).getAsJsonObject();
 
             if (firstCandidate.has("content") && firstCandidate.get("content").isJsonObject()) {
@@ -1071,9 +1071,19 @@ public class GeminiOAuthProvider extends APIProvider implements FunctionCallingP
         }
 
         // Add generation config
+        JsonObject generationConfig = new JsonObject();
         if (maxTokens != null && maxTokens > 0) {
-            JsonObject generationConfig = new JsonObject();
             generationConfig.addProperty("maxOutputTokens", maxTokens);
+        }
+
+        // Add reasoning effort if configured
+        ReasoningConfig reasoning = getReasoningConfig();
+        if (reasoning != null && reasoning.isEnabled()) {
+            // Gemini CLI proxy/backend uses 'thinking_effort' in generation_config
+            generationConfig.addProperty("thinking_effort", reasoning.getEffortString().toLowerCase());
+        }
+
+        if (generationConfig.size() > 0) {
             payload.add("generationConfig", generationConfig);
         }
 

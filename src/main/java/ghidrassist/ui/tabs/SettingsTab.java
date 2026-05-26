@@ -111,7 +111,12 @@ public class SettingsTab extends JPanel {
         String providersJson = Preferences.getProperty("GhidrAssist.APIProviders", "[]");
         Gson gson = new Gson();
         Type listType = new TypeToken<List<APIProviderConfig>>() {}.getType();
-        apiProviders = gson.fromJson(providersJson, listType);
+        try {
+            apiProviders = gson.fromJson(providersJson, listType);
+        } catch (Exception e) {
+            apiProviders = new java.util.ArrayList<>();
+            ghidra.util.Msg.error(this, "Invalid API Providers JSON: " + e.getMessage(), e);
+        }
         if (apiProviders == null) {
             apiProviders = new java.util.ArrayList<>();
         } else {
@@ -642,6 +647,7 @@ public class SettingsTab extends JPanel {
     }
 
     private void onTestProvider() {
+        // Enhanced error handling and logging added for robustness
         if (activeLlmTestWorker != null && !activeLlmTestWorker.isDone()) {
             activeLlmTestWorker.cancel(true);
             llmTestButton.setText("Test");
@@ -677,7 +683,7 @@ public class SettingsTab extends JPanel {
                     testProvider.createProvider().testConnection();
                     return true;
                 } catch (Exception e) {
-                    errorMessage = e.getMessage();
+                    errorMessage = e.getMessage() != null ? e.getMessage() : "Unknown timeout or connection error occurred";
                     return false;
                 }
             }
@@ -694,9 +700,11 @@ public class SettingsTab extends JPanel {
                     if (get()) {
                         llmTestStatusLabel.setIcon(successIcon);
                         llmTestStatusLabel.setToolTipText("Connection successful");
+                        ghidra.util.Msg.info(SettingsTab.this, "Test connection successful for provider: " + testProvider.getName());
                     } else {
                         llmTestStatusLabel.setIcon(failureIcon);
                         llmTestStatusLabel.setToolTipText("Connection failed: " + errorMessage);
+                        ghidra.util.Msg.error(SettingsTab.this, "Test connection failed for provider: " + testProvider.getName() + ". Error: " + errorMessage, new RuntimeException(errorMessage));
                     }
                 } catch (Exception e) {
                     llmTestStatusLabel.setIcon(failureIcon);
@@ -721,6 +729,13 @@ public class SettingsTab extends JPanel {
         typeComboBox.setSelectedItem(provider.getType());
         JCheckBox disableTlsCheckbox = new JCheckBox("Disable TLS Verification", provider.isDisableTlsVerification());
         JCheckBox bypassProxyCheckbox = new JCheckBox("Bypass System Proxy", provider.isBypassProxy());
+        JCheckBox adaptiveThinkingCheckbox = new JCheckBox(
+            "Use adaptive thinking shape (non-Anthropic gateway, e.g. zveno)",
+            Boolean.TRUE.equals(provider.getUseAdaptiveThinking()));
+        adaptiveThinkingCheckbox.setToolTipText(
+            "<html>When checked: send <code>thinking.type=adaptive</code> + <code>output_config.effort</code>.<br>"
+            + "When unchecked: send Anthropic-native <code>thinking.type=enabled</code> + <code>budget_tokens</code>.<br>"
+            + "Only applies to Anthropic Platform API provider type.</html>");
         JButton fetchModelsButton = new JButton("Pull");
         JButton testButton = new JButton("Test");
         JLabel testStatusLabel = new JLabel();
@@ -856,6 +871,11 @@ public class SettingsTab extends JPanel {
         gbc.gridwidth = 1;
         row++;
 
+        gbc.gridx = 1; gbc.gridy = row; gbc.gridwidth = 2;
+        panel.add(adaptiveThinkingCheckbox, gbc);
+        gbc.gridwidth = 1;
+        row++;
+
         boolean[] isUserChange = {false};
 
         Runnable updateUIForProviderType = () -> {
@@ -868,6 +888,9 @@ public class SettingsTab extends JPanel {
             boolean isGeminiOAuth = selectedType == APIProvider.ProviderType.GEMINI_OAUTH;
             boolean isOAuth = isOpenAIOAuth || isGeminiOAuth;
             boolean isAnthropicClaudeCli = selectedType == APIProvider.ProviderType.ANTHROPIC_CLAUDE_CLI;
+
+            boolean isAnthropicPlatform = selectedType == APIProvider.ProviderType.ANTHROPIC_PLATFORM_API;
+            adaptiveThinkingCheckbox.setVisible(isAnthropicPlatform);
 
             authenticateButton.setVisible(isOAuth);
             oauthNoteLabel.setVisible(isOAuth);
@@ -926,7 +949,7 @@ public class SettingsTab extends JPanel {
             try {
                 testConfig = buildProviderConfigFromDialog(
                     nameField, typeComboBox, modelField, maxTokensSpinner, timeoutSpinner,
-                    urlField, keyField, disableTlsCheckbox, bypassProxyCheckbox, false, true);
+                    urlField, keyField, disableTlsCheckbox, bypassProxyCheckbox, adaptiveThinkingCheckbox, false, true);
                 validateProviderForTest(testConfig);
             } catch (IllegalArgumentException ex) {
                 JOptionPane.showMessageDialog(panel, ex.getMessage(), "Validation Error", JOptionPane.ERROR_MESSAGE);
@@ -937,6 +960,11 @@ public class SettingsTab extends JPanel {
             testStatusLabel.setIcon(null);
             testStatusLabel.setText("...");
             testStatusLabel.setToolTipText("Testing connection...");
+
+            ghidra.util.Msg.info(this, "--- LLM Provider Connection Test Started ---");
+            ghidra.util.Msg.info(this, "Provider: " + nameField.getText().trim() + " (" + typeComboBox.getSelectedItem() + ")");
+            ghidra.util.Msg.info(this, "URL: " + urlField.getText().trim());
+            ghidra.util.Msg.info(this, "Model: " + modelField.getText().trim());
 
             SwingWorker<Boolean, Void> worker = new SwingWorker<>() {
                 private String errorMessage = "";
@@ -961,13 +989,16 @@ public class SettingsTab extends JPanel {
                         if (isCancelled()) {
                             return;
                         }
-                        if (get()) {
-                            testStatusLabel.setIcon(successIcon);
-                            testStatusLabel.setToolTipText("Connection successful");
-                        } else {
-                            testStatusLabel.setIcon(failureIcon);
-                            testStatusLabel.setToolTipText("Connection failed: " + errorMessage);
-                        }
+                    if (get()) {
+                        testStatusLabel.setIcon(successIcon);
+                        testStatusLabel.setToolTipText("Connection successful");
+                        ghidra.util.Msg.info(SettingsTab.this, "Connection test successful for " + nameField.getText().trim());
+                    } else {
+                        testStatusLabel.setIcon(failureIcon);
+                        testStatusLabel.setToolTipText("Connection failed: " + errorMessage);
+                        ghidra.util.Msg.error(SettingsTab.this, "Connection test failed for " + nameField.getText().trim() + ": " + errorMessage);
+                    }
+
                     } catch (Exception ex) {
                         testStatusLabel.setIcon(failureIcon);
                         testStatusLabel.setToolTipText("Test error: " + ex.getMessage());
@@ -991,7 +1022,7 @@ public class SettingsTab extends JPanel {
             try {
                 fetchConfig = buildProviderConfigFromDialog(
                     nameField, typeComboBox, modelField, maxTokensSpinner, timeoutSpinner,
-                    urlField, keyField, disableTlsCheckbox, bypassProxyCheckbox, false, false);
+                    urlField, keyField, disableTlsCheckbox, bypassProxyCheckbox, adaptiveThinkingCheckbox, false, false);
                 validateProviderForModelPull(fetchConfig);
             } catch (IllegalArgumentException ex) {
                 JOptionPane.showMessageDialog(panel, ex.getMessage(), "Validation Error", JOptionPane.ERROR_MESSAGE);
@@ -1080,7 +1111,7 @@ public class SettingsTab extends JPanel {
             try {
                 APIProviderConfig updated = buildProviderConfigFromDialog(
                     nameField, typeComboBox, modelField, maxTokensSpinner, timeoutSpinner,
-                    urlField, keyField, disableTlsCheckbox, bypassProxyCheckbox, true, true);
+                    urlField, keyField, disableTlsCheckbox, bypassProxyCheckbox, adaptiveThinkingCheckbox, true, true);
                 validateProviderForSave(updated);
 
                 provider.setName(updated.getName());
@@ -1092,6 +1123,7 @@ public class SettingsTab extends JPanel {
                 provider.setDisableTlsVerification(updated.isDisableTlsVerification());
                 provider.setBypassProxy(updated.isBypassProxy());
                 provider.setTimeout(updated.getTimeout());
+                provider.setUseAdaptiveThinking(updated.getUseAdaptiveThinking());
                 confirmed[0] = true;
                 dialog.dispose();
             } catch (IllegalArgumentException ex) {
@@ -1154,6 +1186,7 @@ public class SettingsTab extends JPanel {
             JTextField keyField,
             JCheckBox disableTlsCheckbox,
             JCheckBox bypassProxyCheckbox,
+            JCheckBox adaptiveThinkingCheckbox,
             boolean requireName,
             boolean requireModel) {
         APIProvider.ProviderType selectedType = (APIProvider.ProviderType) typeComboBox.getSelectedItem();
@@ -1186,7 +1219,7 @@ public class SettingsTab extends JPanel {
             url = url + "/";
         }
 
-        return new APIProviderConfig(
+        APIProviderConfig cfg = new APIProviderConfig(
             name,
             selectedType,
             model,
@@ -1197,6 +1230,10 @@ public class SettingsTab extends JPanel {
             bypassProxyCheckbox.isSelected(),
             timeout
         );
+        if (selectedType == APIProvider.ProviderType.ANTHROPIC_PLATFORM_API) {
+            cfg.setUseAdaptiveThinking(Boolean.valueOf(adaptiveThinkingCheckbox.isSelected()));
+        }
+        return cfg;
     }
 
     private void validateProviderForSave(APIProviderConfig provider) {
@@ -1243,6 +1280,7 @@ public class SettingsTab extends JPanel {
             case ANTHROPIC_PLATFORM_API -> "https://api.anthropic.com/";
             case GEMINI_OAUTH -> "https://cloudcode-pa.googleapis.com/";
             case GEMINI_PLATFORM_API -> "https://generativelanguage.googleapis.com/v1beta/openai/";
+            case GOOGLE_GENAI_API -> "http://localhost:8990/gemini/";
             case LMSTUDIO -> "http://127.0.0.1:1234/";
             case OLLAMA -> "http://127.0.0.1:11434/";
             case OPENAI_OAUTH -> "https://chatgpt.com/backend-api/codex/responses";
@@ -1273,6 +1311,7 @@ public class SettingsTab extends JPanel {
             case AZURE_OPENAI -> "Azure OpenAI";
             case GEMINI_OAUTH -> "Google Gemini OAuth";
             case GEMINI_PLATFORM_API -> "Google Gemini Platform";
+            case GOOGLE_GENAI_API -> "Google GenAI API";
             case LITELLM -> "LiteLLM";
             case LMSTUDIO -> "LM Studio";
             case OLLAMA -> "Ollama";
@@ -1421,6 +1460,7 @@ public class SettingsTab extends JPanel {
     }
 
     private void onTestSymGraph() {
+        // Add similar enhanced error handling and descriptive logging
         // If cancel clicked during test
         if (activeSymGraphTestWorker != null && !activeSymGraphTestWorker.isDone()) {
             activeSymGraphTestWorker.cancel(true);
@@ -1473,7 +1513,7 @@ public class SettingsTab extends JPanel {
 
                             return true;
                         } catch (Exception e) {
-                            errorMessage = e.getMessage();
+errorMessage = e.getMessage() != null ? e.getMessage() : "Unknown error occurred";
                             return false;
                         }
                     }).get(15, TimeUnit.SECONDS);
@@ -1481,7 +1521,7 @@ public class SettingsTab extends JPanel {
                     errorMessage = "Test timed out after 15 seconds";
                     return false;
                 } catch (Exception e) {
-                    errorMessage = e.getMessage();
+                    errorMessage = e.getMessage() != null ? e.getMessage() : "Unknown timeout or connection error occurred";
                     return false;
                 }
             }
@@ -1499,6 +1539,7 @@ public class SettingsTab extends JPanel {
                     } else {
                         symGraphTestStatusLabel.setIcon(failureIcon);
                         symGraphTestStatusLabel.setToolTipText("Connection failed: " + errorMessage);
+ghidra.util.Msg.error(SettingsTab.this, "SymGraph connection failed. Details: " + errorMessage, new Exception(errorMessage));
                     }
                 } catch (Exception e) {
                     symGraphTestStatusLabel.setIcon(failureIcon);

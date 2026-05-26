@@ -61,7 +61,13 @@ public class StreamingMarkdownRenderer {
 
         pendingMarkdown.append(chunk);
 
-        int boundary = BlockBoundaryDetector.findLastStableBoundary(pendingMarkdown.toString());
+        int boundary = BlockBoundaryDetector.findLastStableBoundary(pendingMarkdown.toString().concat("\n"));
+        // Bugfix: detector receives pending+"\n" (length+1) and may return a boundary up to
+        // pending.length()+1 pointing at/past the synthetic sentinel newline. Clamp to the
+        // real pending length before slicing to avoid StringIndexOutOfBoundsException.
+        if (boundary > pendingMarkdown.length()) {
+            boundary = pendingMarkdown.length();
+        }
 
         String committedHtmlToAppend = "";
         if (boundary > 0) {

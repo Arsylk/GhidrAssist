@@ -15,6 +15,11 @@ import java.util.concurrent.TimeoutException;
 
 import javax.net.ssl.SSLException;
 
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import com.google.gson.JsonSyntaxException;
+
 import ghidrassist.LlmApi;
 import ghidrassist.apiprovider.capabilities.ChatProvider;
 import ghidrassist.apiprovider.exceptions.*;
@@ -28,6 +33,7 @@ public abstract class APIProvider implements ChatProvider {
         AZURE_OPENAI,
         GEMINI_OAUTH,
         GEMINI_PLATFORM_API,
+GOOGLE_GENAI_API,
         LITELLM,
         LMSTUDIO,
         OLLAMA,
@@ -49,6 +55,7 @@ public abstract class APIProvider implements ChatProvider {
     protected Duration timeout;
     protected RetryHandler retryHandler;
     protected ReasoningConfig reasoningConfig;
+    protected Boolean useAdaptiveThinking;
 
     public APIProvider(String name, ProviderType type, String model, Integer maxTokens,
                       String url, String key, boolean disableTlsVerification, boolean bypassProxy, Integer timeout2) {
@@ -76,6 +83,9 @@ public abstract class APIProvider implements ChatProvider {
     public String getKey() { return key; }
     public boolean isDisableTlsVerification() { return disableTlsVerification; }
     public boolean isBypassProxy() { return bypassProxy; }
+
+    public Boolean getUseAdaptiveThinking() { return useAdaptiveThinking; }
+    public void setUseAdaptiveThinking(Boolean useAdaptiveThinking) { this.useAdaptiveThinking = useAdaptiveThinking; }
 
     // Reasoning configuration
     public ReasoningConfig getReasoningConfig() {
@@ -346,27 +356,83 @@ public abstract class APIProvider implements ChatProvider {
     
     /**
      * Extract error message from response body (provider-specific)
+     *
+     * Default implementation uses Gson to robustly walk common error shapes:
+     *   { "error": { "message": "..." } }              (OpenAI / Azure)
+     *   { "error": "..." }                              (simple string)
+     *   { "message": "..." }                            (Anthropic / generic)
+     *   { "error": { "error": { "message": "..." } } }  (nested variants)
+     *   { "detail": "..." }                             (LiteLLM / FastAPI)
+     *
+     * The legacy substring-based extractor in prior versions broke on escaped
+     * quotes and could surface a single backslash ("\") as the error message,
+     * rendering in the UI as "Message: \". Using Gson fixes that completely.
      */
     protected String extractErrorMessage(String responseBody, int statusCode) {
-        // Default implementation - subclasses should override for provider-specific logic
-        if (responseBody != null && !responseBody.isEmpty()) {
-            // Try to extract a simple error message
-            if (responseBody.contains("\"message\"")) {
-                try {
-                    int start = responseBody.indexOf("\"message\"") + 10;
-                    int end = responseBody.indexOf("\"", start + 1);
-                    if (end > start) {
-                        return responseBody.substring(start + 1, end);
+        if (responseBody == null || responseBody.isEmpty()) {
+            return null;
+        }
+
+        try {
+            JsonElement root = JsonParser.parseString(responseBody);
+            String message = findFirstMessageField(root, 0);
+            if (message != null && !message.isBlank()) {
+                return message.trim();
+            }
+        } catch (JsonSyntaxException e) {
+            // Not valid JSON - fall through to raw body fallback
+        }
+
+        // Fallback: truncated raw body so the UI at least shows something real
+        return responseBody.length() > 200 ? responseBody.substring(0, 200) + "..." : responseBody;
+    }
+
+    /**
+     * Recursively search a JSON tree for the first string field commonly used
+     * for error messages. Depth-bounded to avoid pathological inputs.
+     */
+    private String findFirstMessageField(JsonElement element, int depth) {
+        if (element == null || depth > 6) {
+            return null;
+        }
+
+        if (element.isJsonObject()) {
+            JsonObject obj = element.getAsJsonObject();
+            // Preferred keys in priority order
+            String[] keys = new String[] { "message", "detail", "error_description", "error_message" };
+            for (String key : keys) {
+                if (obj.has(key)) {
+                    JsonElement v = obj.get(key);
+                    if (v.isJsonPrimitive() && v.getAsJsonPrimitive().isString()) {
+                        String s = v.getAsString();
+                        if (s != null && !s.isBlank()) {
+                            return s;
+                        }
                     }
-                } catch (Exception e) {
-                    // Ignore parsing errors
                 }
             }
-            
-            // Fallback: return truncated response body
-            return responseBody.length() > 200 ? responseBody.substring(0, 200) + "..." : responseBody;
+            // "error" can be either a string or a nested object
+            if (obj.has("error")) {
+                JsonElement err = obj.get("error");
+                if (err.isJsonPrimitive() && err.getAsJsonPrimitive().isString()) {
+                    String s = err.getAsString();
+                    if (s != null && !s.isBlank()) {
+                        return s;
+                    }
+                }
+                String nested = findFirstMessageField(err, depth + 1);
+                if (nested != null) return nested;
+            }
+            for (Map.Entry<String, JsonElement> entry : obj.entrySet()) {
+                String nested = findFirstMessageField(entry.getValue(), depth + 1);
+                if (nested != null) return nested;
+            }
+        } else if (element.isJsonArray()) {
+            for (JsonElement item : element.getAsJsonArray()) {
+                String nested = findFirstMessageField(item, depth + 1);
+                if (nested != null) return nested;
+            }
         }
-        
         return null;
     }
     

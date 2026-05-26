@@ -472,19 +472,30 @@ public class LMStudioProvider extends APIProvider implements FunctionCallingProv
     }
 
     private String extractContentFromResponse(JsonObject responseObj) {
-        return responseObj.getAsJsonArray("choices")
-            .get(0).getAsJsonObject()
-            .getAsJsonObject("message")
-            .get("content").getAsString();
+        JsonArray choices = responseObj.getAsJsonArray("choices");
+        if (choices == null || choices.size() == 0) {
+            return "";
+        }
+        JsonObject choice = choices.get(0).getAsJsonObject();
+        if (choice.has("message") && choice.get("message").isJsonObject()) {
+            JsonObject message = choice.getAsJsonObject("message");
+            if (message.has("content") && !message.get("content").isJsonNull()) {
+                return message.get("content").getAsString();
+            }
+        }
+        return "";
     }
 
     private String extractDeltaContent(JsonObject chunk) {
         try {
-            JsonObject delta = chunk.getAsJsonArray("choices")
-                .get(0).getAsJsonObject()
+            JsonArray choices = chunk.getAsJsonArray("choices");
+            if (choices == null || choices.size() == 0) {
+                return null;
+            }
+            JsonObject delta = choices.get(0).getAsJsonObject()
                 .getAsJsonObject("delta");
             
-            if (delta.has("content")) {
+            if (delta != null && delta.has("content") && !delta.get("content").isJsonNull()) {
                 return delta.get("content").getAsString();
             }
         } catch (Exception e) {
@@ -631,6 +642,7 @@ public class LMStudioProvider extends APIProvider implements FunctionCallingProv
                                             toolCalls.add(new ToolCall(id, name, arguments));
                                         });
 
+                                    finishReason = normalizeLmStudioFinishReason(finishReason, toolCalls);
                                     handler.onStreamComplete(finishReason, textBuilder.toString(), toolCalls);
                                     return;
                                 }
@@ -727,5 +739,34 @@ public class LMStudioProvider extends APIProvider implements FunctionCallingProv
 
     public void cancelRequest() {
         isCancelled = true;
+    }
+
+    /**
+     * If the stream produced tool calls but the model did not set
+     * finish_reason="tool_calls" (some local llama.cpp / lmstudio builds emit
+     * "stop" together with tool_calls), upgrade the reason so the downstream
+     * conversation handler routes them to execution instead of discarding.
+     */
+    private static String normalizeLmStudioFinishReason(String finishReason, java.util.List<ToolCall> toolCalls) {
+        if (toolCalls == null || toolCalls.isEmpty()) {
+            return finishReason;
+        }
+        if ("tool_calls".equals(finishReason) || "function_call".equals(finishReason)) {
+            return finishReason;
+        }
+        boolean hasValidCall = false;
+        for (ToolCall tc : toolCalls) {
+            if (tc != null && tc.name != null && !tc.name.isEmpty()) {
+                hasValidCall = true;
+                break;
+            }
+        }
+        if (!hasValidCall) {
+            return finishReason;
+        }
+        ghidra.util.Msg.info(LMStudioProvider.class,
+            "Normalizing LMStudio stream finish_reason from '" + finishReason + "' to 'tool_calls' ("
+            + toolCalls.size() + " tool calls present)");
+        return "tool_calls";
     }
 }

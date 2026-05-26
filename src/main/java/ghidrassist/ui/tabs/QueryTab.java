@@ -464,7 +464,11 @@ public class QueryTab extends JPanel {
                 // Switch to HTML mode for final markdown rendering
                 responseTextPane.setContentType("text/html");
                 responseTextPane.setEditorKit(new HTMLEditorKit());
-                responseTextPane.setText(htmlText);
+                if (htmlText == null || htmlText.isBlank()) {
+    Msg.warn(this, "Ignoring null or empty response text.");
+    return;
+}
+responseTextPane.setText(htmlText);
 
                 // Restore scroll position - only auto-scroll if user was at bottom
                 SwingUtilities.invokeLater(() -> {
@@ -524,7 +528,11 @@ public class QueryTab extends JPanel {
                 getStreamingCSS(), currentStreamingPrefixHtml, currentStreamingBodyPrefixHtml,
                 currentStreamingBodySuffixHtml);
 
-            responseTextPane.setText(initialHtml);
+            if (initialHtml == null || initialHtml.isBlank()) {
+    Msg.error(this, "Initial HTML content for streaming is null or empty. Aborting initialization.");
+    return;
+}
+responseTextPane.setText(initialHtml);
             responseDocument = responseTextPane.getStyledDocument();
 
             // Restore scroll position
@@ -573,21 +581,35 @@ public class QueryTab extends JPanel {
         int savedScrollValue = scrollManager.getScrollPane().getVerticalScrollBar().getValue();
 
         // Apply the update
-        switch (update.getType()) {
-            case INCREMENTAL -> applyIncrementalUpdate(update);
-            case FULL_REPLACE -> applyFullReplaceUpdate(update);
-        }
-
-        // Restore scroll position or auto-scroll (matching reference implementation)
-        if (wasAtBottom) {
-            SwingUtilities.invokeLater(() -> scrollManager.scrollToBottom());
-        } else {
-            // Restore the user's scroll position exactly
-            SwingUtilities.invokeLater(() ->
-                    scrollManager.getScrollPane().getVerticalScrollBar().setValue(savedScrollValue));
-        }
+        if (update == null) {
+    Msg.error(this, "Render update is null. No operation performed.");
+    return;
+}
+try {
+    switch (update.getType()) {
+        case INCREMENTAL:
+            applyIncrementalUpdate(update);
+            break;
+        case FULL_REPLACE:
+            applyFullReplaceUpdate(update);
+            break;
+        default:
+            Msg.warn(this, "Unrecognized render update type: " + update.getType());
+            break;
     }
+} catch (Exception e) {
+    Msg.error(this, "Error applying render update: " + e.getMessage(), e);
+}
 
+// Restore scroll position or auto-scroll (matching reference implementation)
+if (wasAtBottom) {
+    SwingUtilities.invokeLater(() -> scrollManager.scrollToBottom());
+} else {
+    // Restore the user's scroll position exactly
+    SwingUtilities.invokeLater(() ->
+            scrollManager.getScrollPane().getVerticalScrollBar().setValue(savedScrollValue));
+}
+}
     private void applyIncrementalUpdate(RenderUpdate update) {
         // Track content for fallback rebuilds
         String committedHtml = update.getCommittedHtmlToAppend();

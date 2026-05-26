@@ -356,13 +356,50 @@ public class ConversationalToolHandler {
                                     }
                                 });
                         } else {
-                            // Non-rate-limit errors stop the conversation
-                            isConversationActive = false;
-                            userHandler.onError(cause instanceof Exception ? (Exception) cause : new Exception(cause));
-
-                            if (onCompletionCallback != null) {
-                                onCompletionCallback.run();
+                            // Only retry transient errors (network, timeout, service errors).
+                            // Permanent errors (configuration, authentication, model errors)
+                            // should be reported immediately — retrying will never succeed.
+                            if (cause instanceof ghidrassist.apiprovider.exceptions.APIProviderException) {
+                                ghidrassist.apiprovider.exceptions.APIProviderException ape =
+                                    (ghidrassist.apiprovider.exceptions.APIProviderException) cause;
+                                switch (ape.getCategory()) {
+                                    case CONFIGURATION:
+                                    case AUTHENTICATION:
+                                    case MODEL_ERROR:
+                                    case RESPONSE_ERROR:
+                                        // Permanent errors — stop and report
+                                        isConversationActive = false;
+                                        userHandler.onError(cause instanceof Exception ? (Exception) cause : new Exception(cause));
+                                        if (onCompletionCallback != null) onCompletionCallback.run();
+                                        return null;
+                                    default:
+                                        break;
+                                }
                             }
+
+                            if (isCancelled) {
+                                isConversationActive = false;
+                                userHandler.onError(cause instanceof Exception ? (Exception) cause : new Exception(cause));
+                                if (onCompletionCallback != null) onCompletionCallback.run();
+                                return null;
+                            }
+
+                            rateLimitRetries++;
+                            Msg.warn(ConversationalToolHandler.this,
+                                "Error during tool conversation, retrying (attempt " + rateLimitRetries + "): " + errorMsg);
+                            userHandler.onUpdate(String.format(
+                                "\n⚠️ **Error recovered**: %s\n🔄 Retrying...\n\n",
+                                errorMsg.length() > 100 ? errorMsg.substring(0, 100) + "..." : errorMsg
+                            ));
+
+                            int backoffSeconds = Math.min(5 * rateLimitRetries, 30);
+                            CompletableFuture.delayedExecutor(backoffSeconds, java.util.concurrent.TimeUnit.SECONDS)
+                                .execute(() -> {
+                                    if (!isCancelled) {
+                                        isConversationActive = true;
+                                        continueConversation();
+                                    }
+                                });
                         }
                         return null;
                     });
@@ -602,14 +639,15 @@ public class ConversationalToolHandler {
                             }
                             assistantMsg.setToolCalls(toolCallsArray);
                         } else if (!toolCalls.isEmpty()) {
+                            // Partial / malformed deltas — safe to discard
                             Msg.warn(ConversationalToolHandler.this,
-                                String.format("Discarding %d tool calls because stopReason='%s' (expected 'tool_calls')",
+                                String.format("Discarding %d incomplete tool calls (stopReason='%s')",
                                     toolCalls.size(), stopReason));
                         }
 
                         conversationHistory.add(assistantMsg);
 
-                        if ("tool_calls".equals(stopReason) && !toolCalls.isEmpty()) {
+                        if (shouldExecuteTools) {
                             // Increment tool call round counter (multi-turn tracking)
                             toolCallRound++;
                             Msg.debug(ConversationalToolHandler.this,
@@ -673,10 +711,16 @@ public class ConversationalToolHandler {
                     public void onStreamComplete(String stopReason, String fullText, List<LMStudioProvider.ToolCall> toolCalls) {
                         ChatMessage assistantMsg = new ChatMessage(ChatMessage.ChatMessageRole.ASSISTANT, fullText);
 
-                        // Only attach tool calls when stopReason indicates tool calling.
-                        // If stopReason is "stop" but streaming accumulated partial tool call deltas,
-                        // attaching them creates orphaned tool_calls (no results will follow).
-                        if ("tool_calls".equals(stopReason) && !toolCalls.isEmpty()) {
+                        // See OpenAI handler above — trust complete tool calls even when stopReason is "stop".
+                        boolean shouldExecuteTools = !toolCalls.isEmpty()
+                            && hasCompleteLMStudioToolCalls(toolCalls);
+
+                        if (shouldExecuteTools) {
+                            if (!"tool_calls".equals(stopReason)) {
+                                Msg.info(ConversationalToolHandler.this,
+                                    String.format("Executing %d tool calls despite stopReason='%s' (calls look complete)",
+                                        toolCalls.size(), stopReason));
+                            }
                             JsonArray toolCallsArray = new JsonArray();
                             for (LMStudioProvider.ToolCall toolCall : toolCalls) {
                                 JsonObject toolCallObj = new JsonObject();
@@ -693,13 +737,13 @@ public class ConversationalToolHandler {
                             assistantMsg.setToolCalls(toolCallsArray);
                         } else if (!toolCalls.isEmpty()) {
                             Msg.warn(ConversationalToolHandler.this,
-                                String.format("Discarding %d tool calls because stopReason='%s' (expected 'tool_calls')",
+                                String.format("Discarding %d incomplete tool calls (stopReason='%s')",
                                     toolCalls.size(), stopReason));
                         }
 
                         conversationHistory.add(assistantMsg);
 
-                        if ("tool_calls".equals(stopReason) && !toolCalls.isEmpty()) {
+                        if (shouldExecuteTools) {
                             // Increment tool call round counter (multi-turn tracking)
                             toolCallRound++;
                             Msg.debug(ConversationalToolHandler.this,
@@ -735,6 +779,36 @@ public class ConversationalToolHandler {
     }
 
     /**
+     * Whether a streamed OpenAI tool call list represents a complete (executable)
+     * batch: every call must have a non-blank name. The provider supplies an
+     * arguments string defaulted to "{}" so we don't require arguments to parse
+     * here — partial deltas are caught by the empty/missing name test.
+     */
+    private static boolean hasCompleteOpenAIToolCalls(List<OpenAIPlatformApiProvider.ToolCall> toolCalls) {
+        if (toolCalls == null || toolCalls.isEmpty()) {
+            return false;
+        }
+        for (OpenAIPlatformApiProvider.ToolCall tc : toolCalls) {
+            if (tc == null || tc.name == null || tc.name.isEmpty()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static boolean hasCompleteLMStudioToolCalls(List<LMStudioProvider.ToolCall> toolCalls) {
+        if (toolCalls == null || toolCalls.isEmpty()) {
+            return false;
+        }
+        for (LMStudioProvider.ToolCall tc : toolCalls) {
+            if (tc == null || tc.name == null || tc.name.isEmpty()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
      * Common error handling for streaming providers.
      */
     private void handleStreamingError(Throwable error) {
@@ -759,25 +833,56 @@ public class ConversationalToolHandler {
                     }
                 });
         } else {
-            isConversationActive = false;
-
-            // If tool calls have been executed, gracefully complete with
-            // accumulated content instead of losing all findings
-            if (toolCallRound > 0 && accumulatedAssistantContent.length() > 0) {
-                Msg.warn(this, String.format(
-                    "Stream error after %d tool rounds, completing with accumulated content: %s",
-                    toolCallRound, error.getMessage()));
-                userHandler.onUpdate(String.format(
-                    "\n**Stream interrupted after %d tool rounds** - Completing with current findings.\n\n",
-                    toolCallRound));
-                userHandler.onComplete(accumulatedAssistantContent.toString());
-            } else {
-                userHandler.onError(error);
+            // Only retry transient errors (network, timeout, service errors).
+            // Permanent errors (configuration, authentication, model errors) should
+            // be reported immediately — retrying them will never succeed.
+            if (error instanceof ghidrassist.apiprovider.exceptions.APIProviderException) {
+                ghidrassist.apiprovider.exceptions.APIProviderException ape =
+                    (ghidrassist.apiprovider.exceptions.APIProviderException) error;
+                switch (ape.getCategory()) {
+                    case CONFIGURATION:
+                    case AUTHENTICATION:
+                    case MODEL_ERROR:
+                    case RESPONSE_ERROR:
+                        // Permanent errors — stop and report
+                        isConversationActive = false;
+                        userHandler.onError(error);
+                        if (onCompletionCallback != null) onCompletionCallback.run();
+                        return;
+                    default:
+                        break;
+                }
             }
 
-            if (onCompletionCallback != null) {
-                onCompletionCallback.run();
+            if (isCancelled) {
+                isConversationActive = false;
+                if (toolCallRound > 0 && accumulatedAssistantContent.length() > 0) {
+                    userHandler.onUpdate("\n**Investigation cancelled** - Completing with current findings.\n\n");
+                    userHandler.onComplete(accumulatedAssistantContent.toString());
+                } else {
+                    userHandler.onError(error);
+                }
+                if (onCompletionCallback != null) onCompletionCallback.run();
+                return;
             }
+
+            rateLimitRetries++;
+            String errorMsg = error.getMessage() != null ? error.getMessage() : "Unknown error";
+            Msg.warn(ConversationalToolHandler.this,
+                "Stream error during conversation, retrying (attempt " + rateLimitRetries + "): " + errorMsg);
+            userHandler.onUpdate(String.format(
+                "\n⚠️ **Recovering from error**: %s\n🔄 Retrying...\n\n",
+                errorMsg.length() > 100 ? errorMsg.substring(0, 100) + "..." : errorMsg
+            ));
+
+            int backoffSeconds = Math.min(5 * rateLimitRetries, 30);
+            CompletableFuture.delayedExecutor(backoffSeconds, java.util.concurrent.TimeUnit.SECONDS)
+                .execute(() -> {
+                    if (!isCancelled) {
+                        isConversationActive = true;
+                        continueConversation();
+                    }
+                });
         }
     }
 
@@ -1251,11 +1356,15 @@ public class ConversationalToolHandler {
                         toolName, result.isSuccess(),
                         result.getContent() != null ? result.getContent().length() : 0));
 
-                    // Create tool result for conversation
+                    // Create tool result for conversation. Guarantee non-empty content:
+                    // some upstream LLM APIs (Gemini's OpenAI-compat layer in particular)
+                    // reject the whole next request with an opaque 400 when a tool
+                    // message has empty content. Substitute a meaningful placeholder
+                    // so the model sees the failure and can react.
                     JsonObject toolResult = new JsonObject();
                     toolResult.addProperty("tool_call_id", toolCallId);
                     toolResult.addProperty("role", "tool");
-                    toolResult.addProperty("content", result.getContent());
+                    toolResult.addProperty("content", sanitizeToolResultContent(toolName, result));
 
                     return toolResult;
                 });
@@ -1291,6 +1400,16 @@ public class ConversationalToolHandler {
                 if (idElement != null && !idElement.isJsonNull()) {
                     toolCallId = idElement.getAsString();
                 }
+            }
+
+            // Last-ditch defense: never let an empty content reach the API.
+            // Some providers (Gemini OpenAI-compat) reject the entire next
+            // request with INVALID_ARGUMENT when a tool message has empty
+            // content, masking what was really a tool-execution issue.
+            if (content == null || content.isEmpty()) {
+                Msg.warn(this, "Tool result for tool_call_id=" + toolCallId
+                    + " had empty content; substituting placeholder to avoid downstream API rejection");
+                content = "(tool returned no content — likely an upstream error; check Ghidra log for details)";
             }
 
             ChatMessage toolMessage = new ChatMessage(ChatMessage.ChatMessageRole.TOOL, content);
@@ -1379,6 +1498,29 @@ public class ConversationalToolHandler {
     /**
      * Extract arguments from tool call
      */
+    /**
+     * Produce a guaranteed non-empty content string for the tool message we
+     * send back to the LLM. Prefers ToolResult.content; falls back to
+     * errorMessage when the tool failed; falls back to a generic placeholder
+     * if both are null/empty. This prevents downstream APIs from rejecting the
+     * conversation — Gemini's OpenAI-compatible layer returns
+     * INVALID_ARGUMENT when a tool message has empty content, and that 400
+     * is opaque enough to look like a schema problem rather than what it is.
+     */
+    private static String sanitizeToolResultContent(String toolName, ToolResult result) {
+        if (result == null) {
+            return "(tool '" + toolName + "' returned no result object)";
+        }
+        String text = result.getContentOrError();
+        if (text != null && !text.isEmpty()) {
+            return text;
+        }
+        if (result.isSuccess()) {
+            return "(tool '" + toolName + "' completed with no output)";
+        }
+        return "(tool '" + toolName + "' failed with no error message)";
+    }
+
     private JsonObject extractToolArguments(JsonObject toolCall) {
         JsonObject arguments = new JsonObject();
 
@@ -1393,7 +1535,7 @@ public class ConversationalToolHandler {
                         // Parse string arguments
                         String argsStr = argsElement.getAsString();
                         if (argsStr != null && !argsStr.trim().isEmpty()) {
-                            arguments = JsonParser.parseString(argsStr).getAsJsonObject();
+                            arguments = parseArgumentsStringLenient(argsStr);
                         }
                     }
                 }
@@ -1404,7 +1546,7 @@ public class ConversationalToolHandler {
                 } else if (argsElement.isJsonPrimitive()) {
                     String argsStr = argsElement.getAsString();
                     if (argsStr != null && !argsStr.trim().isEmpty()) {
-                        arguments = JsonParser.parseString(argsStr).getAsJsonObject();
+                        arguments = parseArgumentsStringLenient(argsStr);
                     }
                 }
             }
@@ -1414,6 +1556,113 @@ public class ConversationalToolHandler {
         }
 
         return arguments;
+    }
+
+    /**
+     * Parse a tool-call arguments string with fallbacks for known LLM quirks.
+     *
+     * Some models (Gemini's OpenAI-compat layer in particular) occasionally
+     * emit a single tool_call whose `arguments` field contains MULTIPLE JSON
+     * objects concatenated back-to-back, e.g. {"a":1}{"b":2}{"c":3} — the
+     * model meant to make three separate calls but the streaming serializer
+     * collapsed them. Strict JSON parsing fails on the second `{` and the
+     * agent ends up calling the tool with empty args, which then errors with
+     * "missing required argument", and the empty tool result triggers an
+     * INVALID_ARGUMENT 400 on the next round.
+     *
+     * Strategy: try strict parse first. If that fails AND the string contains
+     * a "}{" boundary, split into pieces, parse each as a JSON object, and
+     * merge — last-write-wins. Merging (rather than dropping all but the first)
+     * means we run the tool once with the union of fields, which matches the
+     * model's apparent intent better than ignoring everything past the first
+     * object.
+     */
+    private JsonObject parseArgumentsStringLenient(String argsStr) {
+        try {
+            JsonElement el = JsonParser.parseString(argsStr);
+            if (el.isJsonObject()) {
+                return el.getAsJsonObject();
+            }
+        } catch (Exception strict) {
+            // fall through to lenient handling
+        }
+        // Detect the concatenated-objects pattern.
+        if (argsStr.contains("}{")) {
+            List<JsonObject> pieces = splitConcatenatedJsonObjects(argsStr);
+            if (!pieces.isEmpty()) {
+                JsonObject merged = new JsonObject();
+                for (JsonObject piece : pieces) {
+                    for (Map.Entry<String, JsonElement> e : piece.entrySet()) {
+                        merged.add(e.getKey(), e.getValue());
+                    }
+                }
+                Msg.warn(this, String.format(
+                    "Tool arguments contained %d concatenated JSON objects (model bug); merged into one call with %d keys",
+                    pieces.size(), merged.size()));
+                return merged;
+            }
+        }
+        // Last attempt: lenient JsonReader (accepts unquoted keys, trailing commas, etc.)
+        try {
+            com.google.gson.stream.JsonReader reader = new com.google.gson.stream.JsonReader(new java.io.StringReader(argsStr));
+            reader.setStrictness(com.google.gson.Strictness.LENIENT);
+            JsonElement el = JsonParser.parseReader(reader);
+            if (el.isJsonObject()) {
+                Msg.warn(this, "Tool arguments only parsed under lenient mode (likely model produced unquoted JSON)");
+                return el.getAsJsonObject();
+            }
+        } catch (Exception ignored) {
+            // fall through
+        }
+        Msg.error(this, "Tool arguments could not be parsed even with lenient strategies; using empty args. Raw: " + argsStr);
+        return new JsonObject();
+    }
+
+    /**
+     * Split a string of the form "{...}{...}{...}" into a list of parsed
+     * JsonObjects. Walks the string tracking brace depth, ignoring braces
+     * that appear inside string literals.
+     */
+    private static List<JsonObject> splitConcatenatedJsonObjects(String s) {
+        List<JsonObject> out = new ArrayList<>();
+        int depth = 0;
+        int start = -1;
+        boolean inString = false;
+        boolean escape = false;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (escape) {
+                escape = false;
+                continue;
+            }
+            if (inString) {
+                if (c == '\\') {
+                    escape = true;
+                } else if (c == '"') {
+                    inString = false;
+                }
+                continue;
+            }
+            if (c == '"') {
+                inString = true;
+            } else if (c == '{') {
+                if (depth == 0) start = i;
+                depth++;
+            } else if (c == '}') {
+                depth--;
+                if (depth == 0 && start >= 0) {
+                    String piece = s.substring(start, i + 1);
+                    try {
+                        JsonElement el = JsonParser.parseString(piece);
+                        if (el.isJsonObject()) out.add(el.getAsJsonObject());
+                    } catch (Exception ignored) {
+                        // skip unparseable piece
+                    }
+                    start = -1;
+                }
+            }
+        }
+        return out;
     }
     
     /**

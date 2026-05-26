@@ -23,6 +23,7 @@ public class MCPServersTab extends JPanel {
     private JButton editButton;
     private JButton removeButton;
     private JButton testButton;
+    private JButton refreshToolsButton;
     private SwingWorker<Boolean, Void> activeTestWorker;
     
     public MCPServersTab() {
@@ -52,6 +53,7 @@ public class MCPServersTab extends JPanel {
         editButton = new JButton("Edit");
         removeButton = new JButton("Remove");
         testButton = new JButton("Test Connection");
+        refreshToolsButton = new JButton("Refresh Tools");
         
         // Initially disable buttons that require selection
         editButton.setEnabled(false);
@@ -73,6 +75,8 @@ public class MCPServersTab extends JPanel {
         buttonPanel.add(removeButton);
         buttonPanel.add(Box.createHorizontalStrut(20));
         buttonPanel.add(testButton);
+        buttonPanel.add(Box.createHorizontalStrut(10));
+        buttonPanel.add(refreshToolsButton);
         
         // Info panel
         JPanel infoPanel = new JPanel(new BorderLayout());
@@ -129,6 +133,7 @@ public class MCPServersTab extends JPanel {
         });
         
         testButton.addActionListener(e -> testConnection());
+        refreshToolsButton.addActionListener(e -> refreshTools());
     }
     
     private void showAddEditDialog(MCPServerConfig existingServer) {

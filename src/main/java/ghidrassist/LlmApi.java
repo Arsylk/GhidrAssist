@@ -1,5 +1,6 @@
 package ghidrassist;
 
+import ghidrassist.apiprovider.APIProvider;
 import ghidrassist.apiprovider.APIProviderConfig;
 import ghidrassist.apiprovider.ChatMessage;
 import ghidrassist.apiprovider.ReasoningConfig;
@@ -35,6 +36,13 @@ public class LlmApi {
     
     public LlmApi(APIProviderConfig config, GhidrAssistPlugin plugin) {
         this.apiClient = new LlmApiClient(config, plugin);
+        this.responseProcessor = new ResponseProcessor();
+        this.taskExecutor = new LlmTaskExecutor();
+        this.errorHandler = new LlmErrorHandler(plugin, this);
+    }
+
+    public LlmApi(APIProvider provider, GhidrAssistPlugin plugin) {
+        this.apiClient = new LlmApiClient(provider, plugin);
         this.responseProcessor = new ResponseProcessor();
         this.taskExecutor = new LlmTaskExecutor();
         this.errorHandler = new LlmErrorHandler(plugin, this);
@@ -281,6 +289,10 @@ public class LlmApi {
 
     public String getProviderModel() {
         return apiClient.getProviderModel();
+    }
+
+    public LlmApiClient getApiClient() {
+        return apiClient;
     }
 
     public void setContextWindowListener(ContextWindowListener contextWindowListener) {

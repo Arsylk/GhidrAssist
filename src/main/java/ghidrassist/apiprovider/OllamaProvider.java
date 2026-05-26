@@ -407,10 +407,27 @@ public class OllamaProvider extends APIProvider implements FunctionCallingProvid
                     }
 
                     JsonObject responseObj = gson.fromJson(responseBody.string(), JsonObject.class);
+                    if (responseObj == null || !responseObj.has("embeddings")) {
+                        callback.onError(new APIProviderException(APIProviderException.ErrorCategory.RESPONSE_ERROR,
+                            name, "getEmbeddingsAsync", "Response missing 'embeddings' array"));
+                        return;
+                    }
                     JsonArray embeddingsArray = responseObj.getAsJsonArray("embeddings");
 
+                    if (embeddingsArray == null || embeddingsArray.size() == 0) {
+                        callback.onError(new APIProviderException(APIProviderException.ErrorCategory.RESPONSE_ERROR,
+                            name, "getEmbeddingsAsync", "Embeddings array is empty or null"));
+                        return;
+                    }
 
-                    JsonArray embeddings = (JsonArray) embeddingsArray.get(0);
+                    JsonElement firstEmbedding = embeddingsArray.get(0);
+                    if (firstEmbedding == null || !firstEmbedding.isJsonArray()) {
+                        callback.onError(new APIProviderException(APIProviderException.ErrorCategory.RESPONSE_ERROR,
+                            name, "getEmbeddingsAsync", "First embedding is missing or not an array"));
+                        return;
+                    }
+
+                    JsonArray embeddings = firstEmbedding.getAsJsonArray();
                     double[] embeddingArray = new double[embeddings.size()];
                     for (int i = 0; i < embeddings.size(); i++) {
                         embeddingArray[i] = embeddings.get(i).getAsDouble();

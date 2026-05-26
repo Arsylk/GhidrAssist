@@ -317,49 +317,55 @@ public class SemanticGraphController {
      * Handle semantic analysis button - LLM summarization of stale nodes.
      * Uses SwingWorker for non-blocking operation.
      */
-    public void handleSemanticAnalysis() {
+    public void handleSemanticAnalysis(/* Add log: IsExisting */) {
         if (plugin.getCurrentProgram() == null) {
             Msg.showWarn(this, null, "No Program", "No program loaded");
             return;
         }
 
-        // If already running, cancel it
+        // Validate existing worker state before creating a new one
         if (semanticAnalysisWorker != null && !semanticAnalysisWorker.isDone()) {
-            semanticAnalysisWorker.requestCancel();
+            Msg.warn(this, "Cannot start semantic analysis. Existing worker is still running.");
             return;
         }
 
         // Create and configure the worker
         semanticAnalysisWorker = new SemanticAnalysisWorker(analysisDB, plugin.getCurrentProgram());
 
+        // Attach progress callback
         semanticAnalysisWorker.setProgressCallback(progress -> {
+            Msg.info(this, String.format("Progress: %d%% - %s", progress.getPercentage(), progress.message));
             semanticGraphTab.showProgress(progress.getPercentage(), progress.message);
         });
 
+        // Attach completion callback
         semanticAnalysisWorker.setCompletedCallback(result -> {
             semanticGraphTab.hideProgress();
             semanticGraphTab.setSemanticAnalysisRunning(false);
             semanticGraphTab.refreshCurrentView();
-            Msg.showInfo(this, null, "Semantic Analysis Complete",
-                    String.format("Summarized %d nodes (%d errors) in %.1fs",
-                            result.summarized, result.errors, result.elapsedMs / 1000.0));
+            Msg.info(this, String.format("Semantic Analysis Complete: %d nodes summarized, %d errors, finished in %.1f seconds.",
+                    result.summarized, result.errors, result.elapsedMs / 1000.0));
         });
 
+        // Attach cancellation callback
         semanticAnalysisWorker.setCancelledCallback(() -> {
+            Msg.warn(this, "Semantic analysis was cancelled by the user.");
             semanticGraphTab.hideProgress();
             semanticGraphTab.setSemanticAnalysisRunning(false);
             semanticGraphTab.refreshCurrentView();
         });
 
+        // Attach failure callback
         semanticAnalysisWorker.setFailedCallback(error -> {
+            Msg.error(this, "Semantic analysis failed: " + error);
             semanticGraphTab.hideProgress();
             semanticGraphTab.setSemanticAnalysisRunning(false);
-            Msg.showError(this, null, "Error", "Failed to run semantic analysis: " + error);
         });
 
         // Start the worker
         semanticGraphTab.setSemanticAnalysisRunning(true);
         semanticGraphTab.showProgress(0, "Starting semantic analysis...");
+        Msg.info(this, "Semantic analysis worker started.");
         semanticAnalysisWorker.execute();
     }
 

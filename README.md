@@ -1,4 +1,13 @@
 # GhidrAssist
+
+## Development Note
+
+### Gradle Build
+- Use the Gradle Wrapper (`gradlew`) from the parent directory of this project:
+```bash
+../gradlew build
+```
+This ensures compatibility with the project-specific Gradle version.
 Author: **Jason Tang**
 
 _An advanced LLM-powered plugin for interactive reverse engineering assistance in Ghidra._

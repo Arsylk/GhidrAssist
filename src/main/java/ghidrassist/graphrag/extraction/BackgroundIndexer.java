@@ -38,6 +38,7 @@ public class BackgroundIndexer {
     private volatile String statusMessage = "Idle";
     private volatile Phase currentPhase = Phase.IDLE;
     private Future<?> currentTask;
+    private volatile SemanticExtractor activeSemanticExtractor;
 
     // References
     private final Program program;
@@ -79,6 +80,16 @@ public class BackgroundIndexer {
      */
     public void setProvider(APIProvider provider) {
         this.provider = provider;
+        if (activeSemanticExtractor != null) {
+            activeSemanticExtractor.setProvider(provider);
+        }
+    }
+
+    /**
+     * Get the current LLM provider.
+     */
+    protected APIProvider getProvider() {
+        return provider;
     }
 
     /**
@@ -230,19 +241,19 @@ public class BackgroundIndexer {
         }
 
         // Phase 2: Semantic Extraction (optional)
-        if (runSemantic && provider != null) {
+        if (runSemantic && getProvider() != null) {
             setPhase(Phase.SEMANTIC_EXTRACTION, "Running LLM summarization...");
 
-            SemanticExtractor semanticExtractor = new SemanticExtractor(provider, graph);
+            activeSemanticExtractor = new SemanticExtractor(getProvider(), graph);
 
             // Configure based on provider type (slower for cloud, faster for local)
             if (isLocalProvider()) {
-                semanticExtractor.setBatchConfig(10, 100); // Faster for local
+                activeSemanticExtractor.setBatchConfig(10, 100); // Faster for local
             } else {
-                semanticExtractor.setBatchConfig(3, 1000); // Slower for cloud (rate limits)
+                activeSemanticExtractor.setBatchConfig(3, 1000); // Slower for cloud (rate limits)
             }
 
-            SemanticExtractor.ExtractionResult semResult = semanticExtractor.summarizeStaleNodes(
+            SemanticExtractor.ExtractionResult semResult = activeSemanticExtractor.summarizeStaleNodes(
                     summarizeLimit,
                     (processed, total, summarized, errors) -> {
                         this.progress.set(processed);
@@ -251,6 +262,8 @@ public class BackgroundIndexer {
                                 String.format("Summarizing: %d/%d (%d errors)", summarized, total, errors));
                     }
             );
+
+            activeSemanticExtractor = null;
 
             if (isCancelled.get()) {
                 setPhase(Phase.CANCELLED, "Cancelled during semantic extraction");
@@ -282,8 +295,9 @@ public class BackgroundIndexer {
     }
 
     private boolean isLocalProvider() {
-        if (provider == null) return false;
-        APIProvider.ProviderType type = provider.getType();
+        APIProvider p = getProvider();
+        if (p == null) return false;
+        APIProvider.ProviderType type = p.getType();
         return type == APIProvider.ProviderType.OLLAMA ||
                type == APIProvider.ProviderType.LMSTUDIO;
     }

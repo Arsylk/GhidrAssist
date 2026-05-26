@@ -95,6 +95,14 @@ public class GraphRAGService {
         } else {
             Msg.warn(this, "LLM provider set to null - background semantic analysis disabled");
         }
+
+        // Propagate to any active indexers
+        for (BackgroundIndexer indexer : activeIndexers.values()) {
+            if (indexer != null && indexer.isRunning()) {
+                indexer.setProvider(provider);
+            }
+        }
+
         // Start background worker if provider is now available and queue has items
         if (provider != null && !semanticQueue.isEmpty()) {
             ensureSemanticWorkerRunning();
@@ -103,6 +111,8 @@ public class GraphRAGService {
 
     /**
      * Check if an LLM provider is configured.
+     *
+     * @return true if a provider is available
      */
     public boolean hasLlmProvider() {
         return llmProvider != null;
@@ -376,7 +386,13 @@ public class GraphRAGService {
         }
 
         BinaryKnowledgeGraph graph = analysisDB.getKnowledgeGraph(programHash);
-        BackgroundIndexer indexer = new BackgroundIndexer(program, graph, monitor);
+        BackgroundIndexer indexer = new BackgroundIndexer(program, graph, monitor) {
+            @Override
+            protected APIProvider getProvider() {
+                APIProvider p = super.getProvider();
+                return (p != null) ? p : llmProvider;
+            }
+        };
 
         if (llmProvider != null) {
             indexer.setProvider(llmProvider);

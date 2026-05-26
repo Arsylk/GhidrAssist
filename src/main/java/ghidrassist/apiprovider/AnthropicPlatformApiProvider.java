@@ -97,11 +97,15 @@ public class AnthropicPlatformApiProvider extends APIProvider implements Functio
             StringBuilder textContent = new StringBuilder();
             if (responseObj.has("content")) {
                 JsonArray contentArray = responseObj.getAsJsonArray("content");
-                for (JsonElement contentElement : contentArray) {
-                    JsonObject contentBlock = contentElement.getAsJsonObject();
-                    String type = contentBlock.get("type").getAsString();
-                    if ("text".equals(type) && contentBlock.has("text")) {
-                        textContent.append(contentBlock.get("text").getAsString());
+                if (contentArray != null) {
+                    for (JsonElement contentElement : contentArray) {
+                        JsonObject contentBlock = contentElement.getAsJsonObject();
+                        if (contentBlock.has("type")) {
+                            String type = contentBlock.get("type").getAsString();
+                            if ("text".equals(type) && contentBlock.has("text")) {
+                                textContent.append(contentBlock.get("text").getAsString());
+                            }
+                        }
                     }
                 }
             }
@@ -971,16 +975,42 @@ public class AnthropicPlatformApiProvider extends APIProvider implements Functio
         }
 
         if (canEnableThinking) {
-            int budget = reasoning.getAnthropicBudget();
-            // Ensure budget_tokens is less than max_tokens
-            Integer maxTokens = super.getMaxTokens();
-            if (maxTokens != null && budget >= maxTokens) {
-                budget = Math.max(1024, maxTokens - 1000);
+            // QUIRK: Some Anthropic-compatible gateways (e.g. api.zveno.ai) reject the native
+            // `thinking.type=enabled` + `budget_tokens` shape and require
+            // `thinking.type=adaptive` + `output_config.effort=low|medium|high` instead.
+            // User override (getUseAdaptiveThinking) wins; when null, fall back to host heuristic:
+            // only the official anthropic.com endpoint gets the native shape.
+            Boolean override = getUseAdaptiveThinking();
+            boolean useAdaptive;
+            if (override != null) {
+                useAdaptive = override.booleanValue();
+            } else {
+                String providerUrl = this.getUrl();
+                boolean isAnthropicOfficial = providerUrl != null
+                    && providerUrl.toLowerCase().contains("anthropic.com");
+                useAdaptive = !isAnthropicOfficial;
             }
+
             JsonObject thinking = new JsonObject();
-            thinking.addProperty("type", "enabled");
-            thinking.addProperty("budget_tokens", budget);
-            payload.add("thinking", thinking);
+            if (!useAdaptive) {
+                int budget = reasoning.getAnthropicBudget();
+                Integer maxTokens = super.getMaxTokens();
+                if (maxTokens != null && budget >= maxTokens) {
+                    budget = Math.max(1024, maxTokens - 1000);
+                }
+                thinking.addProperty("type", "enabled");
+                thinking.addProperty("budget_tokens", budget);
+                payload.add("thinking", thinking);
+            } else {
+                thinking.addProperty("type", "adaptive");
+                payload.add("thinking", thinking);
+                String effortStr = reasoning.getEffortString();
+                if (effortStr != null) {
+                    JsonObject outputConfig = new JsonObject();
+                    outputConfig.addProperty("effort", effortStr);
+                    payload.add("output_config", outputConfig);
+                }
+            }
         }
 
         // Convert the messages to Anthropic's format
